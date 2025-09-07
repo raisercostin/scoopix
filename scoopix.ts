@@ -134,31 +134,28 @@ async function listApps(full: boolean) {
 
   info("listApps completed");
 }
+async function loadBucket(name: string, path: string): Promise<BucketManifest | null> {
+  const manifest: BucketManifest = {};
 
-async function loadAllBuckets(): Promise<Map<string, BucketManifest>> {
-  info(`Loading buckets from config in ${SCOOPIX_HOME}`);
-  const buckets = new Map<string, BucketManifest>();
-  const entries = await listBuckets();
-
-  if (entries.length === 0) {
-    info("No buckets registered");
-  }
-
-  for (const { name, path } of entries) {
-    info(`Reading bucket '${name}' at ${path}`);
-
-    try {
+  try {
+    if (path.startsWith("http://") || path.startsWith("https://")) {
+      // Remote single-file bucket
+      const res = await fetch(path);
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      const text = await res.text();
+      const parsed: BucketManifest = JSON.parse(text);
+      Object.assign(manifest, parsed);
+      info(`Loaded remote bucket '${name}' with ${Object.keys(parsed).length} apps`);
+    } else {
       const stat = await Deno.stat(path);
-      const manifest: BucketManifest = {};
-
       if (stat.isFile && path.endsWith(".json")) {
-        // single-file bucket
+        // Local single-file bucket
         const text = await Deno.readTextFile(path);
         const parsed: BucketManifest = JSON.parse(text);
         Object.assign(manifest, parsed);
         info(`Loaded single-file bucket '${name}' with ${Object.keys(parsed).length} apps`);
       } else if (stat.isDirectory) {
-        // directory bucket
+        // Local directory bucket
         for await (const file of Deno.readDir(path)) {
           if (file.isFile && file.name.endsWith(".json")) {
             const appName = file.name.replace(/\.json$/, "");
@@ -173,16 +170,34 @@ async function loadAllBuckets(): Promise<Map<string, BucketManifest>> {
         }
         info(`Loaded directory bucket '${name}' with ${Object.keys(manifest).length} apps`);
       }
+    }
 
+    return manifest;
+  } catch (err) {
+    info(`Failed to load bucket '${name}': ${err}`);
+    return null;
+  }
+}
+
+async function loadAllBuckets(): Promise<Map<string, BucketManifest>> {
+  info(`Loading buckets from config in ${SCOOPIX_HOME}`);
+  const buckets = new Map<string, BucketManifest>();
+  const entries = await listBuckets();
+
+  if (entries.length === 0) {
+    info("No buckets registered");
+  }
+
+  for (const { name, path } of entries) {
+    info(`Reading bucket '${name}' at ${path}`);
+    const manifest = await loadBucket(name, path);
+    if (manifest) {
       buckets.set(name, manifest);
-    } catch (err) {
-      info(`Failed to load bucket '${name}': ${err}`);
     }
   }
 
   return buckets;
 }
-
 
 async function findApp(app: string): Promise<{ bucket: string; info: any } | null> {
   const buckets = await loadAllBuckets();
