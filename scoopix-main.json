@@ -68,5 +68,62 @@
         "man": "micro-2.0.13/micro.1"
       }
     }
+  },
+  "bcat": {
+    "version": "0.6.2",
+    "description": "Pipe command output to a web browser in real time",
+    "homepage": "https://github.com/rtomayko/bcat",
+    "license": "MIT",
+    "type": "gem",
+    "base": {
+      "git": "https://github.com/rtomayko/bcat.git",
+      "commands": [
+        "git clone {git} .",
+        "gem build bcat.gemspec",
+        "gem install bcat-*.gem --no-document"
+      ],
+      "bin": "bcat"
+    },
+    "arch": {
+      "x86_64": {},
+      "aarch64": {}
+    }
+  },
+  "bcat-compiled": {
+    "version": "0.6",
+    "description": "Pipe command output to a web browser in real time (native binary built with Ruby Packer)",
+    "homepage": "https://github.com/rtomayko/bcat",
+    "license": "MIT",
+    "type": "src",
+    "arch": {
+      "x86_64": {
+        "git": "https://github.com/rtomayko/bcat.git",
+        "docker": {
+          "image": "ruby:3.2-alpine",
+          "commands": [
+            "apk add --no-cache build-base ruby-dev git wget tar",
+            "gem install rubyc",
+            "git clone {git} src",
+            "cd src",
+            "rubyc ./bin/bcat"
+          ],
+          "output": "/src/bcat"
+        }
+      },
+      "windows": {
+        "git": "https://github.com/rtomayko/bcat.git",
+        "docker": {
+          "image": "ruby:3.2-alpine",
+          "commands": [
+            "apk add --no-cache build-base ruby-dev git mingw-w64-gcc binutils-mingw-w64 crossbuild-essential-x86_64",
+            "gem install rubyc",
+            "git clone {git} src",
+            "cd src",
+            "rubyc --arch x64-mingw32 ./bin/bcat"
+          ],
+          "output": "/src/bcat.exe"
+        }
+      }
+    }
   }
 }

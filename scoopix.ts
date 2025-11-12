@@ -355,7 +355,7 @@ async function installApp(
   const currentLink = join(APPS_DIR, appName, "current");
   try {
     await Deno.remove(currentLink, { recursive: true });
-  } catch {}
+  } catch { }
   await Deno.symlink(join(APPS_DIR, appName, version), currentLink, { type: "dir" });
 
   // Symlink into ~/.scoopix/bin
@@ -363,7 +363,7 @@ async function installApp(
   const binPath = join(BIN_DIR, appName);
   try {
     await Deno.remove(binPath);
-  } catch {}
+  } catch { }
   const shimTarget = join(currentLink, "bin", binName);
   await Deno.symlink(shimTarget, binPath, { type: "file" });
 
@@ -479,14 +479,8 @@ async function buildFromSource(
     info(`reusing existing docker image ${imageTag}`);
   } else {
     info(`building new docker image ${imageTag}`);
-
     const runSteps = infoObj.docker.commands
-      .map(c =>
-        c
-          .replace("{url}", infoObj.url ?? "")
-          .replace("{version}", version)
-          .replace("{app}", app)
-      )
+      .map(c => expandPlaceholders(c, { ...infoObj, app, version }))
       .join(" && ");
 
     const dockerfile = [
@@ -503,31 +497,21 @@ async function buildFromSource(
       await Deno.copyFile(tarPath, join(tmpDir, tarName!));
     }
 
-    const build = new Deno.Command("docker", {
-      args: ["build", "-t", imageTag, tmpDir],
-      stdout: "inherit",
-      stderr: "inherit",
-    });
-    const status = await build.output();
-    if (!status.success) {
-      error(`buildFromSource: docker build failed for '${app}'`);
-      Deno.exit(1);
-    }
+    await runCommandWithLogs("docker", ["build", "-t", imageTag, tmpDir], `docker build for '${app}'`);
+  }
+
+  // --- Normalize Docker path for Windows ---
+  function normalizeDockerPath(p: string): string {
+    if (Deno.build.os !== "windows") return p;
+    // Convert "C:\Users\raiser\AppData\Local\Temp\xyz" → "/c/Users/raiser/AppData/Local/Temp/xyz"
+    return p.replace(/^([A-Za-z]):\\/, (_, d) => `/${d.toLowerCase()}/`).replaceAll("\\", "/");
   }
 
   // Run container to copy artifacts from /out to local tmp
   const tmpOut = await Deno.makeTempDir();
-  const run = new Deno.Command("docker", {
-    args: ["run", "--rm", "-v", `${tmpOut}:/out-final`, imageTag],
-    stdout: "inherit",
-    stderr: "inherit",
-  });
-  const runStatus = await run.output();
-  if (!runStatus.success) {
-    error(`buildFromSource: docker run failed for '${app}'`);
-    Deno.exit(1);
-  }
+  const volumeSpec = `${normalizeDockerPath(tmpOut)}:/out-final`;
 
+  await runCommandWithLogs("docker", ["run", "--rm", "-v", volumeSpec, imageTag], `docker run for '${app}'`);
   // Copy built binary into Scoopix apps dir
   const builtBin = join(tmpOut, infoObj.docker.output.replace("/out/", ""));
   if (!(await exists(builtBin))) {
@@ -540,6 +524,67 @@ async function buildFromSource(
   await Deno.chmod(dest, 0o755);
 
   info(`buildFromSource: completed for '${app}'`);
+}
+async function runCommandWithLogs(cmd: string, args: string[], context: string): Promise<void> {
+  const verbose = VERBOSITY > 0;
+  const prefix = `[${context}] `;
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  const dockerEnv =
+    Deno.build.os === "windows" && cmd === "docker"
+      ? { ...Deno.env.toObject(), MSYS_NO_PATHCONV: "1" }
+      : undefined;
+  const process = new Deno.Command(cmd, {
+    args,
+    stdin: "null",
+    stdout: "piped",
+    stderr: "piped",
+    env: dockerEnv,
+  }).spawn();
+
+  let stdoutText = "";
+  let stderrText = "";
+
+  const pump = async (stream: ReadableStream<Uint8Array> | null, isErr: boolean) => {
+    if (!stream) return;
+    const reader = stream.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value);
+      if (isErr) {
+        stderrText += chunk;
+        if (verbose) Deno.stderr.writeSync(encoder.encode(prefix + chunk));
+      } else {
+        stdoutText += chunk;
+        if (verbose) Deno.stdout.writeSync(encoder.encode(prefix + chunk));
+      }
+    }
+  };
+
+  const [status] = await Promise.all([
+    process.status,
+    pump(process.stdout, false),
+    pump(process.stderr, true),
+  ]);
+
+  if (!status.success) {
+    error(`${context} failed`);
+    console.error(`Exit code: ${status.code}`);
+
+    console.error(`ENV:`,dockerEnv);
+    console.error(`COMMAND: ${cmd} ${args.join(" ")}`);
+    if (stderrText.trim()) console.error("---- STDERR ----\n" + stderrText.trim());
+    if (stdoutText.trim()) console.error("---- STDOUT ----\n" + stdoutText.trim());
+    throw new Error(`${context} failed with exit code ${status.code}`);
+  }
+
+  debug(`${context} succeeded`);
+}
+
+
+function expandPlaceholders(cmd: string, obj: Record<string, any>): string {
+  return cmd.replace(/\{(\w+)\}/g, (_, key) => obj[key] ?? "");
 }
 
 const SHELL_RC_MAP: Record<string, string[]> = {
