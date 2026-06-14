@@ -11,6 +11,7 @@ This makes it perfect for systems where you don’t want or can’t use `apt`, `
 - **User-local installs** – binaries go under `~/.scoopix`, isolated from system packages.
 - **Cross-platform** – runs on Linux, WSL2, Synology DSM, Entware, and more.
 - **Source builds via Docker** – if no binary is available, Scoopix can build from source inside a Docker container.
+- **Synology WireGuard from source** – one command can build the `wg` userspace tool and a Synology WireGuard kernel-module SPK instead of relying on an opaque third-party package.
 - **Architecture awareness** – manifests can provide `x86_64`, `aarch64`, `armv7` variants.
 - **Cache support** – downloads and Docker builds are cached; can be bypassed with `--ignore-download-cache` or `--ignore-build-cache`.
 - **Shims directory (`~/.scoopix/bin`)** – added to `PATH`, just like Scoop’s `shims`.
@@ -139,6 +140,8 @@ The combined package is:
 ```sh
 dev/wireguard:1.0.20220627-dsm7.2 - WireGuard userspace tools and Synology kernel module
 ```
+
+The important part: this is a one-command, source-based Synology WireGuard path. Scoopix builds the userspace `wg` binary from `wireguard-tools`, builds the Synology kernel-module SPK in Docker with Synology toolkit tarballs for the detected DSM/platform, and uses the open `vegardit/synology-wireguard` packaging/build recipe as the base instead of downloading an opaque binary SPK.
 
 #### Prerequisites
 
