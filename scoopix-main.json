@@ -71,6 +71,19 @@
   },
   "bcat": {
     "version": "0.6.2",
+    "type": "src",
+    "docker": {
+      "image": "ruby:3.3-alpine",
+      "commands": [
+        "gem install bcat",
+        "mkdir -p /out",
+        "cp /usr/local/bundle/bin/bcat /out/bcat"
+      ],
+      "output": "/out/bcat"
+    }
+  },
+  "bcat-runner-fails-on-windows": {
+    "version": "0.6.2",
     "description": "Pipe command output to a web browser in real time",
     "homepage": "https://github.com/rtomayko/bcat",
     "license": "MIT",
@@ -123,6 +136,240 @@
           ],
           "output": "/src/bcat.exe"
         }
+      }
+    }
+  },
+  "wg": {
+    "version": "1.0.20210914",
+    "description": "WireGuard configuration utility",
+    "homepage": "https://www.wireguard.com/",
+    "license": "GPL-2.0",
+    "type": "src",
+    "url": "https://git.zx2c4.com/wireguard-tools/snapshot/wireguard-tools-1.0.20210914.tar.xz",
+    "docker": {
+      "image": "alpine:edge",
+      "commands": [
+        "apk add --no-cache build-base linux-headers libmnl-dev tar xz",
+        "tar -xf {app}#{version}.tar.gz",
+        "cd wireguard-tools-{version}/src",
+        "make WITH_BASHCOMPLETION=no WITH_WGQUICK=no LDFLAGS='-static'",
+        "mkdir -p /out/bin",
+        "cp wg /out/bin/wg"
+      ],
+      "output": "/out/bin/wg"
+    }
+  },
+  "wireguard": {
+    "version": "1.0.20220627-dsm7.2",
+    "description": "WireGuard userspace tools and Synology kernel module",
+    "homepage": "https://www.wireguard.com/",
+    "license": "GPL-2.0",
+    "type": "meta",
+    "depends": [
+      "wg",
+      "wireguard-kmod-spk"
+    ],
+    "scripts": {
+      "test1": [
+        "echo 'Purpose: verify WireGuard kernel support without changing existing routes.'",
+        "echo 'What it does: creates temporary interface wg-safety, assigns 10.254.254.1/32, verifies default route is unchanged, then deletes the interface.'",
+        "test \"$(id -u)\" = 0 || { echo 'test1 requires root; run with sudo'; exit 1; }",
+        "WG=\"{binDir}/wg\"; IF=wg-safety; KEY=$(mktemp); trap 'ip link delete \"$IF\" 2>/dev/null || true; rm -f \"$KEY\"' EXIT; ip link delete \"$IF\" 2>/dev/null || true; umask 077; \"$WG\" genkey > \"$KEY\"; ip link add dev \"$IF\" type wireguard; \"$WG\" set \"$IF\" private-key \"$KEY\" listen-port 0; ip address add 10.254.254.1/32 dev \"$IF\"; ip link set up dev \"$IF\"; \"$WG\" show \"$IF\"; ROUTE=$(ip route get 1.1.1.1); echo \"$ROUTE\"; case \"$ROUTE\" in *\"dev $IF\"*) echo 'FAILED: default route uses temporary WireGuard interface'; exit 1;; *) echo 'Verified: route to 1.1.1.1 does not use temporary WireGuard interface.';; esac"
+      ],
+      "test2": [
+        "echo 'Purpose: verify a local WireGuard peer handshake without external clients or route changes.'",
+        "echo 'What it does: creates temporary interfaces wg-safety-a and wg-safety-b, peers them over 127.0.0.1, sends one ICMP packet only to trigger WireGuard traffic, verifies a handshake happened, verifies default route is unchanged, then deletes both interfaces.'",
+        "test \"$(id -u)\" = 0 || { echo 'test2 requires root; run with sudo'; exit 1; }",
+        "WG=\"{binDir}/wg\"; A=wg-safety-a; B=wg-safety-b; KA=$(mktemp); KB=$(mktemp); trap 'ip link delete \"$A\" 2>/dev/null || true; ip link delete \"$B\" 2>/dev/null || true; rm -f \"$KA\" \"$KB\"' EXIT; ip link delete \"$A\" 2>/dev/null || true; ip link delete \"$B\" 2>/dev/null || true; umask 077; \"$WG\" genkey > \"$KA\"; \"$WG\" genkey > \"$KB\"; PA=$(\"$WG\" pubkey < \"$KA\"); PB=$(\"$WG\" pubkey < \"$KB\"); ip link add dev \"$A\" type wireguard; ip link add dev \"$B\" type wireguard; \"$WG\" set \"$A\" private-key \"$KA\" listen-port 58101 peer \"$PB\" allowed-ips 10.254.254.2/32 endpoint 127.0.0.1:58102; \"$WG\" set \"$B\" private-key \"$KB\" listen-port 58102 peer \"$PA\" allowed-ips 10.254.254.1/32 endpoint 127.0.0.1:58101; ip address add 10.254.254.1/30 dev \"$A\"; ip address add 10.254.254.2/30 dev \"$B\"; ip link set up dev \"$A\"; ip link set up dev \"$B\"; ping -c 1 -W 2 -I \"$A\" 10.254.254.2 || echo 'Note: ICMP reply was not received; continuing because this test checks WireGuard handshake, not same-namespace ping routing.'; SHOW_A=$(\"$WG\" show \"$A\"); SHOW_B=$(\"$WG\" show \"$B\"); echo \"$SHOW_A\"; echo \"$SHOW_B\"; echo \"$SHOW_A\" | grep 'latest handshake:' >/dev/null || { echo 'FAILED: WireGuard handshake was not observed on wg-safety-a'; exit 1; }; echo \"$SHOW_B\" | grep 'latest handshake:' >/dev/null || { echo 'FAILED: WireGuard handshake was not observed on wg-safety-b'; exit 1; }; ROUTE=$(ip route get 1.1.1.1); echo \"$ROUTE\"; case \"$ROUTE\" in *\"dev $A\"*|*\"dev $B\"*) echo 'FAILED: default route uses temporary WireGuard interface'; exit 1;; *) echo 'Verified: local WireGuard peer handshake was observed and default route is unchanged.';; esac"
+      ],
+      "test3": [
+        "echo 'Purpose: restore the last known-good remote WireGuard peer test server.'",
+        "echo 'What it does: recreates wg-peer-test on UDP 51820 using /root/wg-peer-test/server.key and client.pub, assigns 10.254.253.1/24, and keeps the interface running for the existing Windows client.'",
+        "test \"$(id -u)\" = 0 || { echo 'test3 requires root; run with sudo'; exit 1; }",
+        "WG=\"{binDir}/wg\"; IF=wg-peer-test; DIR=/root/wg-peer-test; PORT=51820; test -f \"$DIR/server.key\" || { echo \"FAILED: missing $DIR/server.key\"; exit 1; }; test -f \"$DIR/client.pub\" || { echo \"FAILED: missing $DIR/client.pub\"; exit 1; }; ip link delete \"$IF\" 2>/dev/null || true; ip link add dev \"$IF\" type wireguard; ip address add 10.254.253.1/24 dev \"$IF\"; \"$WG\" set \"$IF\" private-key \"$DIR/server.key\" listen-port \"$PORT\" peer \"$(cat \"$DIR/client.pub\")\" allowed-ips 10.254.253.2/32; ip link set up dev \"$IF\"; \"$WG\" show \"$IF\"; ROUTE=$(ip route get 1.1.1.1); echo \"$ROUTE\"; case \"$ROUTE\" in *\"dev $IF\"*) echo 'FAILED: default route uses wg-peer-test'; exit 1;; *) echo 'Started: wg-peer-test listens on UDP 51820; Windows endpoint should be <public-hostname>:51820 with AllowedIPs 10.254.253.1/32.';; esac"
+      ]
+    }
+  },
+  "wireguard-kmod-spk": {
+    "version": "1.0.20220627-dsm7.2",
+    "description": "Synology WireGuard kernel module SPK builder",
+    "homepage": "https://github.com/vegardit/synology-wireguard",
+    "license": "MIT",
+    "base": {
+      "type": "artifact",
+      "git": "https://github.com/vegardit/synology-wireguard.git",
+      "vars": {
+        "wireguardVersion": "1.0.20220627",
+        "wireguardToolsVersion": "1.0.20260223",
+        "libmnlVersion": "1.0.5",
+        "systemName": "WireGuard system package"
+      },
+      "output": "artifacts",
+      "flattenOutput": "\\.spk$",
+      "urls": [
+        "https://global.synologydownload.com/download/ToolChain/toolkit/{vars.dsmVer}/base/base_env-{vars.dsmVer}.txz",
+        "https://global.synologydownload.com/download/ToolChain/toolkit/{vars.dsmVer}/{vars.packageArch}/ds.{vars.packageArch}-{vars.dsmVer}.dev.txz",
+        "https://global.synologydownload.com/download/ToolChain/toolkit/{vars.dsmVer}/{vars.packageArch}/ds.{vars.packageArch}-{vars.dsmVer}.env.txz"
+      ],
+      "commands": [
+        "rm -rf src-build && if [ -x /opt/bin/git ]; then GIT=/opt/bin/git; else GIT=git; fi && $GIT clone --depth 1 {git} src-build",
+        "cd src-build && sed -i 's#^export WIREGUARD_VERSION=.*#export WIREGUARD_VERSION={vars.wireguardVersion}#' build.sh",
+        "cd src-build && sed -i 's#^export WIREGUARD_TOOLS_VERSION=.*#export WIREGUARD_TOOLS_VERSION={vars.wireguardToolsVersion}#' build.sh",
+        "cd src-build && sed -i 's#^export LIBMNL_VERSION=.*#export LIBMNL_VERSION={vars.libmnlVersion}#' build.sh",
+        "cd src-build && sed -i '/# Patch WireGuard/i mkdir -p \"$build_env/dev\"\\nmount --bind /dev \"$build_env/dev\"\\n' build.sh",
+        "cd src-build && /usr/local/bin/docker build -t scoopix/synology-wireguard:{version} .",
+        "mkdir -p {outputDir} && cd src-build && /usr/local/bin/docker run --rm --privileged --env PACKAGE_ARCH={vars.packageArch} --env DSM_VER={vars.dsmVer} -v \"{outputDir}:/result_spk\" -v \"{artifactCacheDir}:/toolkit_tarballs\" scoopix/synology-wireguard:{version}"
+      ],
+      "systemCommands": [
+        "if /usr/syno/bin/synopkg status WireGuard >/dev/null 2>&1; then echo 'Verified: Synology WireGuard package is already installed; skipped SPK reinstall.'; else SPK=$(find \"{artifactDir}\" -name '*.spk' ! -name '*_debug.spk' | head -n 1); test -n \"$SPK\"; /usr/syno/bin/synopkg install \"$SPK\" && echo 'Verified: Synology WireGuard package installed from SPK.'; fi",
+        "/var/packages/WireGuard/scripts/start && echo 'Verified: WireGuard package start script succeeded.'"
+      ],
+      "systemInstalledTests": [
+        "/usr/syno/bin/synopkg status WireGuard | grep '\"status\":\"running\"' >/dev/null",
+        "lsmod | grep wireguard >/dev/null"
+      ],
+      "systemPresentTests": [
+        "/usr/syno/bin/synopkg status WireGuard 2>/dev/null | grep '\"package\":\"WireGuard\"' >/dev/null"
+      ],
+      "postInstallTests": [
+        "/usr/syno/bin/synopkg status WireGuard | grep '\"status\":\"running\"' >/dev/null && echo 'Verified: synopkg reports WireGuard is running.'",
+        "/var/packages/WireGuard/scripts/start-stop-status status | grep wireguard >/dev/null && echo 'Verified: WireGuard status script reports the kernel module is loaded.'",
+        "lsmod | grep wireguard >/dev/null && echo 'Verified: lsmod shows the wireguard kernel module is loaded.'",
+        "ip link delete wg-scoopix-test 2>/dev/null || true; ip link add dev wg-scoopix-test type wireguard; ip link delete wg-scoopix-test && echo 'Verified: kernel supports WireGuard interfaces; wg-scoopix-test create/delete succeeded.'"
+      ]
+    },
+    "arch": {
+      "synology-apollolake": {
+        "vars": {
+          "packageArch": "apollolake",
+          "dsmVer": "auto:synology-toolkit-dsm-version"
+        },
+        "dsmVersions": ["6.2", "7.0"],
+        "confirmedModels": [
+          "DS1019+",
+          "DS218+",
+          "DS418play",
+          "DS718+",
+          "DS918+"
+        ]
+      },
+      "synology-armada38x": {
+        "vars": {
+          "packageArch": "armada38x",
+          "dsmVer": "6.2"
+        },
+        "dsmVersions": ["6.2"],
+        "confirmedModels": ["DS116", "DS218j", "RS816"]
+      },
+      "synology-avoton": {
+        "vars": {
+          "packageArch": "avoton",
+          "dsmVer": "6.2"
+        },
+        "dsmVersions": ["6.2"],
+        "confirmedModels": ["DS1817+", "DS1815+", "DS415+"]
+      },
+      "synology-braswell": {
+        "vars": {
+          "packageArch": "braswell",
+          "dsmVer": "auto:synology-toolkit-dsm-version"
+        },
+        "dsmVersions": ["6.2", "7.0"],
+        "confirmedModels": ["DS216+II", "DS916+"]
+      },
+      "synology-broadwell": {
+        "vars": {
+          "packageArch": "broadwell",
+          "dsmVer": "6.2"
+        },
+        "dsmVersions": ["6.2"],
+        "confirmedModels": ["DS3617xs"]
+      },
+      "synology-bromolow": {
+        "vars": {
+          "packageArch": "bromolow",
+          "dsmVer": "6.2"
+        },
+        "dsmVersions": ["6.2"],
+        "confirmedModels": ["XPEnology HP54NL as DS3615xs"]
+      },
+      "synology-cedarview": {
+        "vars": {
+          "packageArch": "cedarview",
+          "dsmVer": "6.2"
+        },
+        "dsmVersions": ["6.2"],
+        "confirmedModels": ["DS713+"]
+      },
+      "synology-denverton": {
+        "vars": {
+          "packageArch": "denverton",
+          "dsmVer": "6.2"
+        },
+        "dsmVersions": ["6.2"],
+        "confirmedModels": ["DS1618+"]
+      },
+      "synology-geminilake": {
+        "vars": {
+          "packageArch": "geminilake",
+          "dsmVer": "auto:synology-toolkit-dsm-version"
+        },
+        "dsmVersions": ["6.2", "7.0", "7.2"],
+        "confirmedModels": ["DS220+", "DS720+", "DS920+"]
+      },
+      "synology-kvmx64": {
+        "vars": {
+          "packageArch": "kvmx64",
+          "dsmVer": "auto:synology-toolkit-dsm-version"
+        },
+        "dsmVersions": ["6.2", "7.0"],
+        "confirmedModels": ["Virtual DSM"]
+      },
+      "synology-monaco": {
+        "vars": {
+          "packageArch": "monaco",
+          "dsmVer": "6.2"
+        },
+        "dsmVersions": ["6.2"],
+        "confirmedModels": ["DS216Play"]
+      },
+      "synology-rtd1296": {
+        "vars": {
+          "packageArch": "rtd1296",
+          "dsmVer": "auto:synology-toolkit-dsm-version"
+        },
+        "dsmVersions": ["6.2", "7.0"],
+        "confirmedModels": ["DS218", "DS418j"]
+      },
+      "synology-v1000": {
+        "vars": {
+          "packageArch": "v1000",
+          "dsmVer": "7.0"
+        },
+        "dsmVersions": ["7.0"],
+        "confirmedModels": ["RS1221+"]
+      },
+      "synology-x64": {
+        "vars": {
+          "packageArch": "x64",
+          "dsmVer": "6.2"
+        },
+        "dsmVersions": ["6.2"],
+        "confirmedModels": ["DS1511+"]
+      }
+    },
+    "unsupported": {
+      "synology-armada370": {
+        "reason": "Kernel version too old",
+        "models": [
+          "DS114",
+          "DS115j",
+          "DS213j",
+          "DS214play",
+          "DS214se",
+          "DS216se",
+          "RS214"
+        ]
       }
     }
   }

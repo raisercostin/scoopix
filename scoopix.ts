@@ -4,22 +4,55 @@ import { exists } from "https://deno.land/std@0.224.0/fs/exists.ts";
 import { join, dirname, basename } from "https://deno.land/std@0.224.0/path/mod.ts";
 import { Command } from "https://deno.land/x/cliffy@v1.0.0-rc.4/command/mod.ts";
 
-const SCOOPIX_HOME = join(Deno.env.get("HOME") ?? ".", ".scoopix");
+function passwdHome(user: string): string | null {
+  if (Deno.build.os === "windows") return null;
+  try {
+    const passwd = Deno.readTextFileSync("/etc/passwd");
+    for (const line of passwd.split("\n")) {
+      const parts = line.split(":");
+      if (parts[0] === user && parts[5]) return parts[5];
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function scoopixUserHome(): string {
+  const home = Deno.env.get("HOME") ?? ".";
+  const sudoUser = Deno.env.get("SUDO_USER");
+  if (sudoUser && home === "/root") {
+    return passwdHome(sudoUser) ?? home;
+  }
+  return home;
+}
+
+const USER_HOME = scoopixUserHome();
+const SCOOPIX_HOME = join(USER_HOME, ".scoopix");
 const APPS_DIR = join(SCOOPIX_HOME, "apps");
 const BIN_DIR = join(SCOOPIX_HOME, "bin");
-const DEFAULT_BIN_DIR = join(Deno.env.get("HOME") ?? ".", "bin");
+const DEFAULT_BIN_DIR = join(USER_HOME, "bin");
 const CACHE_DIR = join(SCOOPIX_HOME, "cache");
 const TEMP_DIR = join(SCOOPIX_HOME, "temp");
+const ARTIFACTS_DIR = join(SCOOPIX_HOME, "artifacts");
+const STATE_DIR = join(SCOOPIX_HOME, "state");
+const LOCKS_DIR = join(SCOOPIX_HOME, "locks");
+const DENO_RUN_FLAGS = "--allow-read --allow-write --allow-net --allow-env --allow-run";
 
 let VERBOSITY = 1
 let QUIET = 0
 let firstTime = true;
-function error(msg: string) { log(0, msg); }
-function warn(msg: string) { info(msg); }
-function info(msg: string) { log(2, msg); }
-function debug(msg: string) { log(3, msg); }
-function trace(msg: string) { log(4, msg); }
+function error(msg: string) { logAt(0, "ERROR", msg); }
+function warn(msg: string) { logAt(1, "WARN", msg); }
+function status(msg: string) { logAt(1, "STATUS", msg); }
+function info(msg: string) { logAt(2, "INFO", msg); }
+function debug(msg: string) { logAt(3, "DEBUG", msg); }
+function trace(msg: string) { logAt(4, "TRACE", msg); }
 function log(level: number, msg: string) {
+  const prefix = ["ERROR", "WARN", "INFO", "DEBUG", "TRACE", "TRACE5"][level] ?? "LOG";
+  logAt(level, prefix, msg);
+}
+function logAt(level: number, prefix: string, msg: string) {
   if (firstTime) {
     firstTime = false;
     info(`Scoopix home directory: ${SCOOPIX_HOME}`);
@@ -27,9 +60,12 @@ function log(level: number, msg: string) {
     debug(`Scoopix verbosity level: ${VERBOSITY - QUIET}`);
   }
   if (level <= VERBOSITY - QUIET) {
-    const prefix = ["ERROR", "WARN", "INFO", "DEBUG", "TRACE", "TRACE5"][level] ?? "LOG";
     console.error(`[${prefix}] ${msg}`);
   }
+}
+
+function safeStateName(value: string): string {
+  return value.replace(/[^A-Za-z0-9_.-]+/g, "_");
 }
 
 type BucketAppBinary = {
@@ -43,6 +79,7 @@ type BucketAppSource = {
   version: string;
   url: string;
   type: "src";
+  vars?: Record<string, string | number | boolean>;
   docker: {
     image: string;
     commands: string[];
@@ -75,8 +112,12 @@ export interface ScoopixApp {
   description?: string;
   homepage?: string;
   license?: string;
-  type?: "bin" | "src";
+  vars?: Record<string, string | number | boolean>;
+  scripts?: Record<string, string | string[]>;
+  depends?: string[];
+  type?: "bin" | "src" | "meta";
   url?: string;
+  urls?: string[];
   extract?: "zip" | "tar.gz" | "tgz";
   bin?: ScoopixBinary;
   arch?: Record<string, ScoopixArchEntry>;
@@ -164,7 +205,7 @@ async function loadBucket(name: string, path: string): Promise<BucketManifest | 
               manifest[appName] = JSON.parse(text);
               info(`Loaded app '${appName}' from bucket '${name}'`);
             } catch (err) {
-              info(`Failed to parse ${file.name} in bucket '${name}': ${err}`);
+              warn(`Failed to parse ${file.name} in bucket '${name}': ${err}`);
             }
           }
         }
@@ -174,7 +215,7 @@ async function loadBucket(name: string, path: string): Promise<BucketManifest | 
 
     return manifest;
   } catch (err) {
-    info(`Failed to load bucket '${name}': ${err}`);
+    error(`Failed to load bucket '${name}' from ${path}: ${err}`);
     return null;
   }
 }
@@ -301,12 +342,7 @@ async function downloadAndInstall(
   await Deno.chmod(dest, 0o755);
   info(`downloadAndInstall: saved to ${dest}`);
 }
-async function installApp(
-  app: string,
-  opts: { ignoreBuildCache?: boolean; ignoreDownloadCache?: boolean; keepTemp?: boolean } = {}
-) {
-  info(`installApp called with app='${app}'`);
-
+async function resolveAppInfo(app: string): Promise<{ appName: string; version: string; info: ScoopixApp; bucket: string }> {
   const found = await findApp(app);
   if (!found) {
     error(`installApp: app '${app}' not found`);
@@ -317,60 +353,92 @@ async function installApp(
   const appInfo = found.info;
   const appName = app.includes("/") ? app.split("/").pop()! : app;
   const version = appInfo.version ?? "unknown";
+  const archKeys = await detectHostArchKeys();
+  const archLabel = archKeys.join(", ");
 
-  const arch = await detectArch();
-  info(`installApp: detected architecture '${arch}'`);
-
-  // Merge parent-level and arch-specific fields
-  const archObj = appInfo.arch?.[arch];
-  const infoObj = { ...appInfo, ...(archObj ?? {}) };
-
-  if (appInfo.type !== "src" && !infoObj.url) {
-    error(`installApp: no URL found for '${appName}' (arch=${arch})`);
+  info(`installApp: detected host keys '${archLabel}'`);
+  const archObj = archKeys.map(key => appInfo.arch?.[key]).find(Boolean);
+  if (appInfo.arch && !archObj) {
+    error(`installApp: '${appName}' is not available for this host (host keys=${archLabel})`);
+    console.error(`Available arch keys: ${Object.keys(appInfo.arch).join(", ")}`);
     Deno.exit(1);
   }
 
-  const appDir = join(APPS_DIR, appName, version, "bin");
-  await ensureDir(appDir);
+  // --- base fallback logic ---
+  const merged = {
+    ...appInfo,
+    ...(appInfo.base ?? {}),
+    ...(archObj ?? {}),
+    vars: {
+      ...(appInfo.vars ?? {}),
+      ...(appInfo.base?.vars ?? {}),
+      ...(archObj?.vars ?? {}),
+    },
+  };
 
-  // Use manifest’s `bin` path if defined, otherwise default to appName
-  const binName = infoObj.bin ?? appName;
-  const dest = join(appDir, binName);
-
-  if (infoObj.type === "src") {
-    info(`installApp: source build requested for '${appName}'`);
-    await buildFromSource(appName, infoObj, dest, opts);
-  } else {
-    info(`installApp: downloading binary from ${infoObj.url} -> ${dest}`);
-    await downloadAndInstall(
-      infoObj.url!,
-      dest,
-      infoObj.extract,
-      infoObj.bin,
-      { keepTemp: opts.keepTemp, man: infoObj.man, appName }
-    );
+  if (merged.type !== "src" && merged.type !== "meta" && !merged.url && !merged.commands) {
+    error(`installApp: no URL or commands found for '${appName}' (host keys=${archLabel})`);
+    Deno.exit(1);
   }
 
-  // Symlink "current"
+  return { appName, version, info: merged, bucket: found.bucket };
+}
+
+async function prepareAppDirectories(appName: string, version: string, binName: string) {
+  const appDir = join(APPS_DIR, appName, version, "bin");
+  await ensureDir(appDir);
+  const dest = join(appDir, binName);
+  return { appDir, dest };
+}
+
+async function installFromBinary(infoObj: ScoopixApp, dest: string, opts: any) {
+  info(`installApp: downloading binary from ${infoObj.url} -> ${dest}`);
+  await downloadAndInstall(
+    infoObj.url!,
+    dest,
+    infoObj.extract,
+    infoObj.bin,
+    { keepTemp: opts.keepTemp, man: infoObj.man, appName: infoObj.bin?.toString() ?? basename(dest) }
+  );
+}
+
+async function installFromDelegated(infoObj: ScoopixApp, appName: string) {
+  info(`installApp: delegated install (commands) for '${appName}'`);
+  const workDir = join(TEMP_DIR, appName);
+  await Deno.remove(workDir, { recursive: true }).catch(() => {});
+  await ensureDir(workDir);
+
+  for (const cmd of infoObj.commands ?? []) {
+    const expanded = expandPlaceholders(cmd, { ...infoObj, ...(infoObj.vars ?? {}), app: appName });
+    await runCommandWithLogs("bash", ["-c", expanded], `delegated ${appName}`, workDir);
+  }
+}
+
+async function linkAppBinaries(appName: string, version: string, binName: string) {
   const currentLink = join(APPS_DIR, appName, "current");
-  try {
-    await Deno.remove(currentLink, { recursive: true });
-  } catch { }
+  try { await Deno.remove(currentLink, { recursive: true }); } catch { }
   await Deno.symlink(join(APPS_DIR, appName, version), currentLink, { type: "dir" });
 
-  // Symlink into ~/.scoopix/bin
   await ensureDir(BIN_DIR);
   const binPath = join(BIN_DIR, appName);
-  try {
-    await Deno.remove(binPath);
-  } catch { }
+  try { await Deno.remove(binPath); } catch { }
   const shimTarget = join(currentLink, "bin", binName);
   await Deno.symlink(shimTarget, binPath, { type: "file" });
 
-  info(`installApp: completed installation of '${appName}'`);
   console.log(`Installed '${appName}' -> ${binPath} (-> ${shimTarget})`);
+}
 
-  // PATH check
+async function isAppLinked(appName: string, version: string, binName: string): Promise<boolean> {
+  const binPath = join(BIN_DIR, appName);
+  const shimTarget = join(APPS_DIR, appName, "current", "bin", binName);
+  try {
+    return await Deno.realPath(binPath) === await Deno.realPath(shimTarget);
+  } catch {
+    return false;
+  }
+}
+
+async function verifyEnvPaths() {
   const currentPath = Deno.env.get("PATH") ?? "";
   if (!currentPath.split(":").includes(BIN_DIR)) {
     const suggestions = await detectShellInits();
@@ -385,7 +453,6 @@ async function installApp(
     );
   }
 
-  // MANPATH check
   const currentManpath = Deno.env.get("MANPATH") ?? "";
   const scoopixMan = join(SCOOPIX_HOME, "share", "man");
   if (!currentManpath.split(":").includes(scoopixMan)) {
@@ -395,6 +462,73 @@ async function installApp(
       `  export MANPATH="$HOME/.scoopix/share/man:$MANPATH"\n`
     );
   }
+}
+
+async function installApp(app: string, opts: any = {}) {
+  info(`installApp called with app='${app}'`);
+  const installOpts = { ...opts, requestedApp: opts.requestedApp ?? app };
+
+  const { appName, version, info: infoObj, bucket } = await resolveAppInfo(app);
+  const stack = installOpts.stack ?? [];
+  if (stack.includes(appName)) {
+    throw new Error(`Dependency cycle detected: ${[...stack, appName].join(" -> ")}`);
+  }
+
+  for (const dependency of infoObj.depends ?? []) {
+    const dependencyApp = dependency.includes("/") ? dependency : `${bucket}/${dependency}`;
+    await installApp(dependencyApp, { ...installOpts, stack: [...stack, appName], suppressOutput: true });
+  }
+
+  if ((infoObj as any).type === "meta") {
+    if (!installOpts.suppressOutput) {
+      const description = infoObj.description ? ` - ${infoObj.description}` : "";
+      console.log(`Already installed: ${bucket}/${appName}:${version}${description}`);
+    }
+    info(`installApp: completed meta package '${appName}'`);
+    return;
+  }
+
+  if ((infoObj as any).type === "artifact") {
+    await installArtifact(appName, version, infoObj as any, installOpts);
+    info(`installApp: completed artifact build of '${appName}'`);
+    return;
+  }
+
+  const binName = infoObj.bin?.toString() ?? appName;
+  const { dest } = await prepareAppDirectories(appName, version, binName);
+  const canUseInstalled = !installOpts.ignoreBuildCache && !installOpts.ignoreDownloadCache;
+
+  if (canUseInstalled && await exists(dest)) {
+    if (await isAppLinked(appName, version, binName)) {
+      if (!installOpts.suppressOutput) {
+        console.log(`Already installed: ${appName} ${version}.`);
+        await verifyEnvPaths();
+      }
+      return;
+    }
+    await linkAppBinaries(appName, version, binName);
+    if (!installOpts.suppressOutput) {
+      console.log(`Relinked existing: ${appName} ${version}.`);
+      await verifyEnvPaths();
+    }
+    return;
+  }
+
+  if (infoObj.commands) {
+    await installFromDelegated(infoObj, appName);
+  } else if (infoObj.type === "src") {
+    info(`installApp: source build requested for '${appName}'`);
+    await buildFromSource(appName, infoObj as any, dest, opts);
+  } else {
+    await installFromBinary(infoObj, dest, opts);
+  }
+
+  await linkAppBinaries(appName, version, binName);
+  if (!installOpts.suppressOutput) {
+    await verifyEnvPaths();
+  }
+
+  info(`installApp: completed installation of '${appName}'`);
 }
 
 async function detectArch(): Promise<string> {
@@ -422,6 +556,20 @@ async function detectArch(): Promise<string> {
   }
 }
 
+async function detectHostArchKeys(): Promise<string[]> {
+  const keys: string[] = [];
+  const uname = await captureCommand("uname", ["-a"]);
+  const synologyPlatform = uname.code === 0 ? uname.stdout.match(/synology_([^\s]+)/)?.[1] : undefined;
+  if (synologyPlatform) {
+    const packageArch = synologyPlatform.split("_")[0];
+    keys.push(`synology-${synologyPlatform}`);
+    keys.push(`synology-${packageArch}`);
+    keys.push("synology");
+  }
+  keys.push(await detectArch());
+  return [...new Set(keys)];
+}
+
 async function uninstallApp(app: string) {
   const dest = join(DEFAULT_BIN_DIR, app);
   if (await exists(dest)) {
@@ -437,36 +585,44 @@ async function buildFromSource(
   dest: string,
   opts: { ignoreBuildCache?: boolean; ignoreDownloadCache?: boolean } = {},
 ) {
-  info(`buildFromSource called for '${app}'`);
-
+  info(`=== buildFromSource: START for '${app}' ===`);
   const version = infoObj.version ?? "unknown";
   const imageTag = `scoopix/${app}:${version}`;
   const cacheDir = join(SCOOPIX_HOME, "cache");
+  const dockerPath = await dockerCommandPath();
+  if (!dockerPath) {
+    throw new Error("Docker not found. Install Docker/Container Manager or add docker to PATH.");
+  }
   await ensureDir(cacheDir);
 
-  // Optional tarball caching (only if url is present)
+  // -------------------------------
+  // PHASE 1: download source
+  // -------------------------------
   let tarName: string | undefined;
   let tarPath: string | undefined;
   if (infoObj.url) {
     tarName = `${app}#${version}.tar.gz`;
     tarPath = join(cacheDir, tarName);
     if (opts.ignoreDownloadCache || !(await exists(tarPath))) {
-      info(`downloading source tarball into cache: ${tarPath}`);
+      info(`[download] curl -L ${infoObj.url} -o ${tarPath}`);
       const resp = await fetch(infoObj.url);
-      if (!resp.ok) {
-        throw new Error(`Failed to download source: ${resp.status} ${resp.statusText}`);
-      }
+      if (!resp.ok) throw new Error(`Failed to download source: ${resp.status} ${resp.statusText}`);
       const file = await Deno.open(tarPath, { write: true, create: true, truncate: true });
       await resp.body?.pipeTo(file.writable);
+      info(`[download] done`);
     } else {
-      info(`using cached source tarball: ${tarPath}`);
+      info(`[download] using cached source tarball: ${tarPath}`);
     }
+  } else {
+    info(`[download] no source URL specified`);
   }
 
-  // Check if we can reuse docker image
+  // -------------------------------
+  // PHASE 2: build docker image
+  // -------------------------------
   let reuseImage = !opts.ignoreBuildCache;
   if (reuseImage) {
-    const check = new Deno.Command("docker", {
+    const check = new Deno.Command(dockerPath, {
       args: ["images", "-q", imageTag],
       stdout: "piped",
       stderr: "null",
@@ -476,66 +632,125 @@ async function buildFromSource(
   }
 
   if (reuseImage) {
-    info(`reusing existing docker image ${imageTag}`);
+    info(`[build] reusing existing docker image ${imageTag}`);
   } else {
-    info(`building new docker image ${imageTag}`);
     const runSteps = infoObj.docker.commands
-      .map(c => expandPlaceholders(c, { ...infoObj, app, version }))
+      .map(c => expandPlaceholders(c, { ...infoObj, ...(infoObj.vars ?? {}), app, version }))
       .join(" && ");
 
     const dockerfile = [
       `FROM ${infoObj.docker.image}`,
       `WORKDIR /build`,
       tarName ? `COPY ${tarName} /build/` : "",
-      `RUN ${runSteps}`,
-      `CMD ["cp", "-r", "/out/.", "/out-final/"]`,
+      `RUN echo '[docker] Running build commands:' && echo '${runSteps}' && ${runSteps}`,
+      `CMD ["cp", "-rv", "/out/.", "/out-final/"]`,
     ].filter(Boolean).join("\n");
 
     const tmpDir = await Deno.makeTempDir();
-    await Deno.writeTextFile(join(tmpDir, "Dockerfile"), dockerfile);
-    if (tarPath) {
-      await Deno.copyFile(tarPath, join(tmpDir, tarName!));
-    }
+    const dockerfilePath = join(tmpDir, "Dockerfile");
+    await Deno.writeTextFile(dockerfilePath, dockerfile);
+    if (tarPath) await Deno.copyFile(tarPath, join(tmpDir, tarName!));
 
-    await runCommandWithLogs("docker", ["build", "-t", imageTag, tmpDir], `docker build for '${app}'`);
+    info(`[build] context dir: ${tmpDir}`);
+    info(`[build] dockerfile:\n${dockerfile}`);
+    const dockerBuildCmd = `${dockerPath} build -t ${imageTag} ${tmpDir}`;
+    info(`[build] running: ${dockerBuildCmd}`);
+    await runCommandWithLogs(dockerPath, ["build", "-t", imageTag, tmpDir], `docker build for '${app}'`);
   }
 
-  // --- Normalize Docker path for Windows ---
-  function normalizeDockerPath(p: string): string {
-    if (Deno.build.os !== "windows") return p;
-    // Convert "C:\Users\raiser\AppData\Local\Temp\xyz" → "/c/Users/raiser/AppData/Local/Temp/xyz"
-    return p.replace(/^([A-Za-z]):\\/, (_, d) => `/${d.toLowerCase()}/`).replaceAll("\\", "/");
-  }
-
-  // Run container to copy artifacts from /out to local tmp
+  // -------------------------------
+  // PHASE 3: docker run
+  // -------------------------------
   const tmpOut = await Deno.makeTempDir();
   const volumeSpec = `${normalizeDockerPath(tmpOut)}:/out-final`;
+  const dockerRunCmd = `${dockerPath} run --rm -v ${volumeSpec} ${imageTag}`;
+  status(`[run] will execute: ${dockerRunCmd}`);
+  status(`[run] container will copy /out -> host ${tmpOut}`);
+  await runCommandWithLogs(dockerPath, ["run", "--rm", "-v", volumeSpec, imageTag], `docker run for '${app}'`);
 
-  await runCommandWithLogs("docker", ["run", "--rm", "-v", volumeSpec, imageTag], `docker run for '${app}'`);
-  // Copy built binary into Scoopix apps dir
+  // -------------------------------
+  // PHASE 4: extract binary
+  // -------------------------------
   const builtBin = join(tmpOut, infoObj.docker.output.replace("/out/", ""));
+  info(`[extract] expecting: ${builtBin}`);
+  info(`[extract] verifying existence...`);
+
   if (!(await exists(builtBin))) {
-    error(`Expected binary not found at ${builtBin}`);
-    console.error(`Build completed but no binary '${app}' found in /out/bin/`);
+    error(`[extract] expected binary not found: ${builtBin}`);
+    console.error("--- DEBUG INFO ---");
+    console.error(`Docker image tag: ${imageTag}`);
+    console.error(`Expected docker output: ${infoObj.docker.output}`);
+    console.error(`Temp output dir: ${tmpOut}`);
+    console.error(`Try manually:\n  docker run -it ${imageTag} sh\n  ls -l /out\n`);
+    console.error(`Or rerun manually the extraction command:\n  ${dockerRunCmd}`);
+    for await (const f of Deno.readDir(tmpOut)) console.error(" ", f.name);
     Deno.exit(1);
   }
-  info(`copying '${builtBin}' -> '${dest}'`);
+
+  await ensureDir(dirname(dest));
+  const copyCmd = `cp ${builtBin} ${dest}`;
+  info(`[extract] running: ${copyCmd}`);
   await Deno.copyFile(builtBin, dest);
   await Deno.chmod(dest, 0o755);
 
-  info(`buildFromSource: completed for '${app}'`);
+  info(`=== buildFromSource: DONE for '${app}' ===`);
 }
-async function runCommandWithLogs(cmd: string, args: string[], context: string): Promise<void> {
-  const verbose = VERBOSITY > 0;
+
+function normalizeDockerPath(p: string): string {
+  if (Deno.build.os !== "windows") return p;
+  return p.replace(/^([A-Za-z]):\\/, (_, d) => `/${d.toLowerCase()}/`).replaceAll("\\", "/");
+}
+
+function shellQuote(value: string): string {
+  if (/^[A-Za-z0-9_/:=.,@%+-]+$/.test(value)) return value;
+  return `'${value.replaceAll("'", "'\"'\"'")}'`;
+}
+
+function formatCommand(cmd: string, args: string[]): string {
+  return [cmd, ...args].map(shellQuote).join(" ");
+}
+
+function displayPath(path: string): string {
+  return path.replaceAll("\\", "/");
+}
+
+function formatStream(value: string): string {
+  const trimmed = value.trimEnd();
+  return trimmed.length > 0 ? trimmed : "<empty>";
+}
+
+async function runCommandWithLogs(
+  cmd: string,
+  args: string[],
+  context: string,
+  cwd?: string,
+  opts: { briefFailure?: boolean } = {},
+): Promise<void> {
+  const showChildOutput = VERBOSITY - QUIET > 0;
+  const showCommandTranscript = !opts.briefFailure || VERBOSITY - QUIET >= 2;
   const prefix = `[${context}] `;
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
-  const dockerEnv =
-    Deno.build.os === "windows" && cmd === "docker"
-      ? { ...Deno.env.toObject(), MSYS_NO_PATHCONV: "1" }
-      : undefined;
+  const startedAt = Date.now();
+
+  const dockerEnv = (Deno.build.os === "windows" && cmd === "docker")
+    ? { ...Deno.env.toObject(), MSYS_NO_PATHCONV: "1" }
+    : undefined;
+
+  const formattedCommand = formatCommand(cmd, args);
+  if (showCommandTranscript) {
+    status(`# ${context}`);
+    status(`# cwd: ${displayPath(cwd ?? Deno.cwd())}`);
+    status(formattedCommand);
+    if (cmd === "bash" && args[0] === "-c" && args[1]) {
+      status("# bash script:");
+      status(args[1]);
+    }
+  }
+
   const process = new Deno.Command(cmd, {
     args,
+    cwd,
     stdin: "null",
     stdout: "piped",
     stderr: "piped",
@@ -554,37 +769,396 @@ async function runCommandWithLogs(cmd: string, args: string[], context: string):
       const chunk = decoder.decode(value);
       if (isErr) {
         stderrText += chunk;
-        if (verbose) Deno.stderr.writeSync(encoder.encode(prefix + chunk));
+        if (showChildOutput) Deno.stderr.writeSync(encoder.encode(prefix + chunk));
       } else {
         stdoutText += chunk;
-        if (verbose) Deno.stdout.writeSync(encoder.encode(prefix + chunk));
+        if (showChildOutput) Deno.stdout.writeSync(encoder.encode(prefix + chunk));
       }
     }
   };
 
-  const [status] = await Promise.all([
+  const [commandStatus] = await Promise.all([
     process.status,
     pump(process.stdout, false),
     pump(process.stderr, true),
   ]);
 
-  if (!status.success) {
+  const durationMs = Date.now() - startedAt;
+  if (!commandStatus.success) {
+    if (opts.briefFailure) {
+      throw new Error(`${context} failed with exit code ${commandStatus.code}`);
+    }
     error(`${context} failed`);
-    console.error(`Exit code: ${status.code}`);
-
-    console.error(`ENV:`,dockerEnv);
-    console.error(`COMMAND: ${cmd} ${args.join(" ")}`);
-    if (stderrText.trim()) console.error("---- STDERR ----\n" + stderrText.trim());
-    if (stdoutText.trim()) console.error("---- STDOUT ----\n" + stdoutText.trim());
-    throw new Error(`${context} failed with exit code ${status.code}`);
+    console.error(`Command: ${formattedCommand}`);
+    console.error(`Workdir: ${displayPath(cwd ?? Deno.cwd())}`);
+    console.error(`Exit code: ${commandStatus.code}`);
+    console.error(`Duration: ${durationMs} ms`);
+    console.error(`stdout/stderr policy: captured separately; streamed while running when not quiet`);
+    if (dockerEnv) console.error(`Environment overrides:`, dockerEnv);
+    console.error("---- STDOUT ----\n" + formatStream(stdoutText));
+    console.error("---- STDERR ----\n" + formatStream(stderrText));
+    throw new Error(`${context} failed with exit code ${commandStatus.code}`);
   }
 
-  debug(`${context} succeeded`);
+  debug(`# ${context} completed; exit code 0; duration ${durationMs} ms`);
 }
 
 
+function placeholderValue(obj: Record<string, any>, path: string): unknown {
+  return path.split(".").reduce((value, key) => {
+    if (value && typeof value === "object" && key in value) {
+      return (value as Record<string, unknown>)[key];
+    }
+    return undefined;
+  }, obj as unknown);
+}
+
 function expandPlaceholders(cmd: string, obj: Record<string, any>): string {
-  return cmd.replace(/\{(\w+)\}/g, (_, key) => obj[key] ?? "");
+  return cmd.replace(/\{([\w.]+)\}/g, (_, key) => {
+    const value = placeholderValue(obj, key);
+    return value === undefined || value === null ? "" : String(value);
+  });
+}
+
+async function downloadFile(url: string, dest: string, opts: { force?: boolean; label?: string } = {}) {
+  if (!opts.force && await exists(dest)) {
+    status(`[download] using cached file ${dest}`);
+    return;
+  }
+
+  await ensureDir(dirname(dest));
+  const tempDest = `${dest}.part`;
+  await Deno.remove(tempDest, { recursive: true }).catch(() => {});
+
+  status(`[download] ${url} -> ${dest}`);
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`Failed to download ${url}: ${resp.status} ${resp.statusText}`);
+
+  const total = Number(resp.headers.get("content-length") ?? "0");
+  const file = await Deno.open(tempDest, { write: true, create: true, truncate: true });
+  const reader = resp.body?.getReader();
+  if (!reader) {
+    file.close();
+    throw new Error(`Download response has no body: ${url}`);
+  }
+
+  let downloaded = 0;
+  let lastPrinted = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      await file.write(value);
+      downloaded += value.length;
+      const now = Date.now();
+      if (now - lastPrinted > 1000) {
+        lastPrinted = now;
+        if (total > 0) {
+          const pct = ((downloaded / total) * 100).toFixed(1);
+          status(`[download] ${opts.label ?? basename(dest)} ${pct}% (${downloaded}/${total} bytes)`);
+        } else {
+          status(`[download] ${opts.label ?? basename(dest)} ${downloaded} bytes`);
+        }
+      }
+    }
+  } finally {
+    file.close();
+  }
+
+  await Deno.remove(dest).catch(() => {});
+  await Deno.rename(tempDest, dest);
+  status(`[download] completed ${dest}`);
+}
+
+async function copyTree(src: string, dest: string) {
+  const stat = await Deno.stat(src);
+  if (stat.isDirectory) {
+    await ensureDir(dest);
+    for await (const entry of Deno.readDir(src)) {
+      await copyTree(join(src, entry.name), join(dest, entry.name));
+    }
+  } else {
+    await ensureDir(dirname(dest));
+    await Deno.copyFile(src, dest);
+  }
+}
+
+async function copyMatchingFiles(src: string, dest: string, pattern: RegExp) {
+  const stat = await Deno.stat(src);
+  if (stat.isDirectory) {
+    for await (const entry of Deno.readDir(src)) {
+      await copyMatchingFiles(join(src, entry.name), dest, pattern);
+    }
+  } else if (pattern.test(basename(src))) {
+    await ensureDir(dest);
+    await Deno.copyFile(src, join(dest, basename(src)));
+  }
+}
+
+async function removeTree(path: string, label: string) {
+  try {
+    await Deno.remove(path, { recursive: true });
+  } catch (err) {
+    warn(`${label}: could not remove ${path}: ${err}`);
+  }
+}
+
+async function hasDirectoryEntries(path: string): Promise<boolean> {
+  try {
+    for await (const _entry of Deno.readDir(path)) return true;
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+async function isRootUser(): Promise<boolean> {
+  if (Deno.build.os === "windows") return false;
+  const id = await captureCommand("id", ["-u"]);
+  return id.code === 0 && id.stdout.trim() === "0";
+}
+
+async function writeInstallState(app: string, statusValue: "installed" | "failed", detail: Record<string, unknown> = {}) {
+  await ensureDir(STATE_DIR);
+  const statePath = join(STATE_DIR, `${safeStateName(app)}.json`);
+  await Deno.writeTextFile(statePath, JSON.stringify({
+    app,
+    status: statusValue,
+    updatedAt: new Date().toISOString(),
+    ...detail,
+  }, null, 2));
+}
+
+async function readInstallState(app: string): Promise<any | null> {
+  try {
+    return JSON.parse(await Deno.readTextFile(join(STATE_DIR, `${safeStateName(app)}.json`)));
+  } catch {
+    return null;
+  }
+}
+
+async function withInstallLock<T>(app: string, fn: () => Promise<T>): Promise<T> {
+  await ensureDir(LOCKS_DIR);
+  const lockDir = join(LOCKS_DIR, `${safeStateName(app)}.lock`);
+  try {
+    await Deno.mkdir(lockDir);
+    await Deno.writeTextFile(join(lockDir, "owner.json"), JSON.stringify({
+      app,
+      pid: Deno.pid,
+      startedAt: new Date().toISOString(),
+    }, null, 2));
+  } catch {
+    const ownerPath = join(lockDir, "owner.json");
+    let detail = lockDir;
+    try {
+      detail = await Deno.readTextFile(ownerPath);
+    } catch {
+      // Keep the lock path as the diagnostic.
+    }
+    throw new Error(`another install is already running or a previous install left a lock: ${detail}`);
+  }
+
+  try {
+    return await fn();
+  } finally {
+    await Deno.remove(lockDir, { recursive: true }).catch(() => {});
+  }
+}
+
+async function runManifestCommands(
+  commands: string[] | undefined,
+  placeholders: Record<string, any>,
+  context: string,
+  cwd: string,
+  opts: { briefFailure?: boolean } = {},
+) {
+  for (const cmd of commands ?? []) {
+    const expanded = expandPlaceholders(cmd, placeholders);
+    await runCommandWithLogs("bash", ["-c", expanded], context, cwd, opts);
+  }
+}
+
+function commandList(commandOrCommands: string | string[] | undefined): string[] {
+  if (!commandOrCommands) return [];
+  return Array.isArray(commandOrCommands) ? commandOrCommands : [commandOrCommands];
+}
+
+async function runPackageScriptAction(app: string, scriptName: string) {
+  try {
+    await runPackageScript(app, scriptName);
+  } catch (err) {
+    error(`Script failed: ${app} ${scriptName}`);
+    console.error(`Reason: ${err instanceof Error ? err.message : String(err)}`);
+    if (VERBOSITY - QUIET >= 2 && err instanceof Error && err.stack) {
+      console.error(err.stack);
+    }
+    Deno.exit(1);
+  }
+}
+
+async function runPackageScript(app: string, scriptName: string) {
+  const { appName, version, info: infoObj, bucket } = await resolveAppInfo(app);
+  const script = infoObj.scripts?.[scriptName];
+  if (!script) {
+    error(`script '${scriptName}' not found for '${bucket}/${appName}'`);
+    const names = Object.keys(infoObj.scripts ?? {});
+    console.error(names.length ? `Available scripts: ${names.join(", ")}` : "This package defines no scripts.");
+    Deno.exit(1);
+  }
+
+  const vars = await resolveVars(infoObj.vars ?? {});
+  const workDir = join(TEMP_DIR, appName, "scripts", scriptName);
+  await ensureDir(workDir);
+  const placeholders = {
+    ...infoObj,
+    ...vars,
+    vars,
+    app: appName,
+    bucket,
+    version,
+    scoopixHome: SCOOPIX_HOME,
+    binDir: BIN_DIR,
+    tempDir: TEMP_DIR,
+    workDir,
+  };
+
+  console.log(`Running: ${bucket}/${appName}:${version} ${scriptName}`);
+  await runManifestCommands(commandList(script), placeholders, `script ${bucket}/${appName}:${scriptName}`, workDir, { briefFailure: true });
+  console.log(`Script complete: ${bucket}/${appName}:${version} ${scriptName}`);
+}
+
+async function manifestCommandsPass(
+  commands: string[] | undefined,
+  placeholders: Record<string, any>,
+  cwd: string,
+): Promise<boolean> {
+  if (!commands?.length) return false;
+  await ensureDir(cwd);
+  for (const cmd of commands) {
+    const expanded = expandPlaceholders(cmd, placeholders);
+    const result = await new Deno.Command("bash", {
+      args: ["-c", expanded],
+      cwd,
+      stdout: "null",
+      stderr: "null",
+    }).output();
+    if (result.code !== 0) return false;
+  }
+  return true;
+}
+
+async function installArtifact(appName: string, version: string, infoObj: any, opts: any = {}) {
+  const workDir = join(TEMP_DIR, appName);
+  const outputRel = infoObj.output ?? "artifacts";
+  const outputDir = join(workDir, outputRel);
+  const artifactDir = join(ARTIFACTS_DIR, appName, version);
+  const artifactCacheDir = join(CACHE_DIR, appName);
+  const vars = await resolveVars(infoObj.vars ?? {});
+  const placeholders = {
+    ...infoObj,
+    ...vars,
+    vars,
+    app: appName,
+    version,
+    workDir,
+    outputDir,
+    artifactDir,
+    cacheDir: CACHE_DIR,
+    artifactCacheDir,
+  };
+
+  const runSystemPhase = async () => {
+    const requestedApp = opts.requestedApp ?? appName;
+    info(`installArtifact: ${appName} has ${(infoObj.systemInstalledTests ?? []).length} system-installed tests`);
+    if (opts.system) {
+      if (!(await isRootUser())) {
+        error(`installArtifact: --system requires root for '${appName}'`);
+        console.error("To install system-wide, start the command with sudo:");
+        console.error(`  sudo deno run ${DENO_RUN_FLAGS} scoopix-dev.ts install ${requestedApp} --system`);
+        Deno.exit(1);
+      }
+      await runManifestCommands(infoObj.systemCommands, placeholders, `system ${appName}`, workDir);
+      await runManifestCommands(infoObj.postInstallTests, placeholders, `post-install-test ${appName}`, workDir);
+      if (!opts.suppressOutput) {
+        console.log(`Installed and verified: ${placeholders.systemName ?? appName}.`);
+      }
+    } else if (infoObj.systemCommands?.length) {
+      if (await manifestCommandsPass(infoObj.systemPresentTests, placeholders, workDir)) {
+        if (!opts.suppressOutput) {
+          console.log(`Already installed: ${placeholders.systemName ?? appName}.`);
+        }
+        return;
+      }
+      if (!opts.suppressOutput) {
+        warn(`installArtifact: '${appName}' was built only; system install commands were not run.`);
+        console.log("To install system-wide, run:");
+        console.log(`  sudo deno run ${DENO_RUN_FLAGS} scoopix-dev.ts install ${requestedApp} --system`);
+      }
+    } else {
+      if (!opts.suppressOutput) {
+        console.log("Install manually or with a future --system command. For Synology SPKs, use DSM Package Center or synopkg.");
+      }
+    }
+  };
+
+  if (!opts.forceArtifactBuild && await hasDirectoryEntries(artifactDir)) {
+    info(`installArtifact: using cached artifact '${appName}' ${version} -> ${artifactDir}`);
+    if (opts.system) {
+      await ensureDir(workDir);
+    }
+    await runSystemPhase();
+    if (opts.system && !opts.keepTemp) {
+      await removeTree(workDir, "installArtifact cleanup after cached artifact");
+    }
+    return;
+  }
+
+  if (opts.system && await isRootUser()) {
+    warn("installArtifact: building as root because --system was requested; cache/temp/artifact files under HOME may become root-owned.");
+    warn("installArtifact: to avoid that, build once without --system as the normal user, then rerun --system to reuse the cached artifact.");
+  }
+
+  status(`installArtifact: building artifact '${appName}' ${version}`);
+  await removeTree(workDir, "installArtifact cleanup before build");
+  await ensureDir(workDir);
+  await ensureDir(artifactCacheDir);
+
+  const urls = [infoObj.url, ...(infoObj.urls ?? [])].filter((url): url is string => typeof url === "string" && url.length > 0);
+  for (const entry of urls) {
+    const url = expandPlaceholders(entry, placeholders);
+    const dest = join(artifactCacheDir, basename(new URL(url).pathname));
+    await downloadFile(url, dest, {
+      force: opts.ignoreDownloadCache,
+      label: `${appName}/${basename(dest)}`,
+    });
+  }
+
+  await runManifestCommands(infoObj.commands, placeholders, `artifact ${appName}`, workDir);
+
+  if (!(await exists(outputDir))) {
+    error(`installArtifact: expected output directory not found: ${outputDir}`);
+    Deno.exit(1);
+  }
+
+  await removeTree(artifactDir, "installArtifact cleanup before copy");
+  if (infoObj.flattenOutput) {
+    await copyMatchingFiles(outputDir, artifactDir, new RegExp(infoObj.flattenOutput));
+  } else {
+    await copyTree(outputDir, artifactDir);
+  }
+  if (!opts.suppressOutput) {
+    console.log(`Compiled: ${placeholders.systemName ?? appName} artifact ${version}.`);
+  } else {
+    info(`Compiled artifact '${appName}' ${version} -> ${artifactDir}`);
+  }
+
+  await runSystemPhase();
+
+  if (!opts.keepTemp) {
+    await removeTree(workDir, "installArtifact cleanup after build");
+  } else {
+    warn(`installArtifact: kept temp dir for debugging: ${workDir}`);
+  }
 }
 
 const SHELL_RC_MAP: Record<string, string[]> = {
@@ -689,26 +1263,296 @@ async function initShell(shellArg?: string) {
   }
 }
 
+type DoctorCheck = {
+  name: string;
+  status: "ok" | "warn" | "fail" | "info";
+  detail: string;
+};
+
+function printDoctorCheck(check: DoctorCheck) {
+  const marker = {
+    ok: "OK",
+    warn: "WARN",
+    fail: "FAIL",
+    info: "INFO",
+  }[check.status];
+  console.log(`[${marker}] ${check.name}: ${check.detail}`);
+}
+
+async function captureCommand(
+  cmd: string,
+  args: string[] = [],
+): Promise<{ code: number; stdout: string; stderr: string; missing: boolean }> {
+  try {
+    const result = await new Deno.Command(cmd, {
+      args,
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    return {
+      code: result.code,
+      stdout: new TextDecoder().decode(result.stdout).trim(),
+      stderr: new TextDecoder().decode(result.stderr).trim(),
+      missing: false,
+    };
+  } catch (err) {
+    return { code: 127, stdout: "", stderr: String(err), missing: true };
+  }
+}
+
+async function commandPath(cmd: string): Promise<string | null> {
+  const found = Deno.build.os === "windows"
+    ? await captureCommand("where", [cmd])
+    : await captureCommand("sh", ["-c", `command -v ${cmd}`]);
+  if (found.code !== 0 || !found.stdout) return null;
+  return found.stdout.split(/\r?\n/)[0];
+}
+
+async function firstExisting(paths: string[]): Promise<string | null> {
+  for (const path of paths) {
+    if (await exists(path)) return path;
+  }
+  return null;
+}
+
+async function dockerCommandPath(): Promise<string | null> {
+  return await commandPath("docker") ?? await firstExisting([
+    "/usr/local/bin/docker",
+    "/usr/bin/docker",
+    "/var/packages/ContainerManager/target/usr/bin/docker",
+    "/var/packages/Docker/target/usr/bin/docker",
+  ]);
+}
+
+async function readIfExists(path: string): Promise<string | null> {
+  try {
+    return await Deno.readTextFile(path);
+  } catch {
+    return null;
+  }
+}
+
+function parseSynologyVersion(text: string): Record<string, string> {
+  const values: Record<string, string> = {};
+  for (const line of text.split(/\r?\n/)) {
+    const match = line.match(/^([a-zA-Z0-9_]+)="?([^"]*)"?$/);
+    if (match) values[match[1]] = match[2];
+  }
+  return values;
+}
+
+async function detectSynologyPackageArch(): Promise<string | null> {
+  const uname = await captureCommand("uname", ["-a"]);
+  if (uname.code !== 0) return null;
+  const platform = uname.stdout.match(/synology_([^\s]+)/)?.[1];
+  return platform?.split("_")[0] ?? null;
+}
+
+async function detectSynologyDsmVersion(): Promise<string | null> {
+  const versionText = await readIfExists("/etc.defaults/VERSION");
+  if (!versionText) return null;
+  return parseSynologyVersion(versionText).productversion ?? null;
+}
+
+function synologyToolkitDsmVersion(productVersion: string): string {
+  const majorMinor = productVersion.match(/^(\d+)\.(\d+)/);
+  if (!majorMinor) return productVersion;
+  const major = Number(majorMinor[1]);
+  const minor = Number(majorMinor[2]);
+  if (major === 7 && minor >= 2) return "7.2";
+  return `${major}.${minor}`;
+}
+
+async function detectSynologyToolkitDsmVersion(): Promise<string | null> {
+  const productVersion = await detectSynologyDsmVersion();
+  return productVersion ? synologyToolkitDsmVersion(productVersion) : null;
+}
+
+async function resolveVars(rawVars: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+  const resolved: Record<string, unknown> = {};
+  for (const [name, value] of Object.entries(rawVars)) {
+    if (value === "auto:synology-package-arch") {
+      const detected = await detectSynologyPackageArch();
+      if (!detected) throw new Error(`Could not auto-detect vars.${name}: Synology package arch not found in uname`);
+      resolved[name] = detected;
+    } else if (value === "auto:synology-dsm-version") {
+      const detected = await detectSynologyDsmVersion();
+      if (!detected) throw new Error(`Could not auto-detect vars.${name}: /etc.defaults/VERSION is unavailable`);
+      resolved[name] = detected;
+    } else if (value === "auto:synology-dsm-major-minor") {
+      const detected = await detectSynologyDsmVersion();
+      const majorMinor = detected?.match(/^\d+\.\d+/)?.[0];
+      if (!majorMinor) throw new Error(`Could not auto-detect vars.${name}: DSM major.minor version is unavailable`);
+      resolved[name] = majorMinor;
+    } else if (value === "auto:synology-toolkit-dsm-version") {
+      const detected = await detectSynologyToolkitDsmVersion();
+      if (!detected) throw new Error(`Could not auto-detect vars.${name}: Synology toolkit DSM version is unavailable`);
+      resolved[name] = detected;
+    } else {
+      resolved[name] = value;
+    }
+  }
+  return resolved;
+}
+
+async function doctorHost() {
+  console.log("Scoopix doctor: host");
+
+  const installerPackageArch = await detectSynologyPackageArch();
+  const installedDsmVersion = await detectSynologyDsmVersion();
+  const installerDsmVer = await detectSynologyToolkitDsmVersion();
+  if (installerPackageArch || installerDsmVer || installedDsmVersion) {
+    console.log("Installer variables:");
+    printDoctorCheck({
+      name: "vars.packageArch",
+      status: installerPackageArch ? "ok" : "warn",
+      detail: installerPackageArch ?? "not detected",
+    });
+    printDoctorCheck({
+      name: "vars.dsmVer",
+      status: installerDsmVer ? "ok" : "warn",
+      detail: installerDsmVer
+        ? `${installerDsmVer}${installedDsmVersion && installedDsmVersion !== installerDsmVer ? ` (from DSM ${installedDsmVersion})` : ""}`
+        : "not detected",
+    });
+  }
+
+  const versionText = await readIfExists("/etc.defaults/VERSION");
+  if (versionText) {
+    const version = parseSynologyVersion(versionText);
+    const label = [
+      version.os_name ?? "DSM",
+      version.productversion,
+      version.buildnumber ? `build ${version.buildnumber}` : undefined,
+      version.smallfixnumber ? `update ${version.smallfixnumber}` : undefined,
+    ].filter(Boolean).join(" ");
+    printDoctorCheck({ name: "DSM version", status: "ok", detail: label });
+  } else {
+    printDoctorCheck({ name: "DSM version", status: "info", detail: "not Synology DSM or /etc.defaults/VERSION is unreadable" });
+  }
+
+  const uname = await captureCommand("uname", ["-a"]);
+  if (uname.code === 0) {
+    printDoctorCheck({ name: "Kernel", status: "ok", detail: uname.stdout });
+    const platform = uname.stdout.match(/synology_([^\s]+)/)?.[1];
+    printDoctorCheck({
+      name: "Synology platform",
+      status: platform ? "ok" : "warn",
+      detail: platform ?? "could not detect synology_<platform> from uname",
+    });
+  } else {
+    printDoctorCheck({ name: "Kernel", status: "fail", detail: uname.stderr || "uname failed" });
+  }
+
+  const lsmod = await captureCommand("lsmod");
+  if (lsmod.code === 0) {
+    const moduleCount = lsmod.stdout.split(/\r?\n/).filter(Boolean).length;
+    printDoctorCheck({ name: "Kernel modules", status: "ok", detail: `${moduleCount} modules listed` });
+  } else {
+    printDoctorCheck({ name: "Kernel modules", status: "warn", detail: lsmod.stderr || "lsmod unavailable" });
+  }
+
+  const ipPath = await commandPath("ip");
+  printDoctorCheck({
+    name: "iproute2",
+    status: ipPath ? "ok" : "warn",
+    detail: ipPath ?? "ip command not found",
+  });
+
+  const dockerPath = await dockerCommandPath();
+  if (dockerPath) {
+    const docker = await captureCommand(dockerPath, ["version"]);
+    printDoctorCheck({
+      name: "Docker",
+      status: docker.code === 0 ? "ok" : "warn",
+      detail: docker.code === 0 ? dockerPath : `${dockerPath} exists but daemon check failed: ${docker.stderr || docker.stdout}`,
+    });
+  } else {
+    printDoctorCheck({ name: "Docker", status: "warn", detail: "docker not found on PATH; SPK artifact builds require Docker or Container Manager" });
+  }
+
+  const gitPath = await commandPath("git") ?? await firstExisting([
+    "/opt/bin/git",
+    "/usr/local/bin/git",
+    "/usr/bin/git",
+    "/bin/git",
+  ]);
+  printDoctorCheck({
+    name: "git",
+    status: gitPath ? "ok" : "warn",
+    detail: gitPath ?? "git not found on PATH; source-based SPK builds need git or a source archive",
+  });
+}
+
+async function doctor(topic?: string) {
+  const selected = topic ?? "host";
+  if (selected === "host" || selected === "all") {
+    await doctorHost();
+    return;
+  }
+  console.error(`Unknown doctor topic '${selected}'. Available topics: host`);
+  Deno.exit(1);
+}
+
 await new Command()
   .name("scoopix")
   .version("0.1.0")
   .description("Scoop like installer for Linux - user space, buckets, user light contributions")
-  .action(function () { this.showHelp(); })
+  .arguments("[app:string] [script:string]")
+  .action(async function (_opts, app, script) {
+    if (app && script) {
+      await runPackageScriptAction(app, script);
+      return;
+    }
+    this.showHelp();
+  })
   .globalOption("-v, --verbose", "Increase verbosity", { collect: true, value: () => { VERBOSITY++; return VERBOSITY; } })
   .globalOption("-q, --quiet", "Decrease verbosity", { collect: true, value: () => { QUIET++; return QUIET; } })
   .command("install <app:string>", "Install an app from all buckets")
   .option("--ignore-build-cache", "Force rebuild from source, ignoring cached Docker image")
   .option("--ignore-download-cache", "Force re-download even if cached")
+  .option("--force-artifact-build", "Force rebuilding artifact outputs even if cached")
   .option("--keep-temp", "Keep extracted files in ~/.scoopix/temp/<app>")
+  .option("--system", "Run system install commands after building, requires root")
   .action(async (opts, app) => {
-    await installApp(app, {
-      ignoreBuildCache: opts.ignoreBuildCache,
-      ignoreDownloadCache: opts.ignoreDownloadCache,
-      keepTemp: opts.keepTemp,
-    });
+    try {
+      await withInstallLock(app, async () => {
+        const previous = await readInstallState(app);
+        if (previous?.status === "failed") {
+          warn(`Previous install failed for '${app}' at ${previous.updatedAt}. Retrying now.`);
+        }
+        if (opts.system && !(await isRootUser())) {
+          error(`install: --system requires root for '${app}'`);
+          console.error("To install system-wide, start the command with sudo:");
+          console.error(`  sudo deno run ${DENO_RUN_FLAGS} scoopix-dev.ts install ${app} --system`);
+          Deno.exit(1);
+        }
+        await installApp(app, {
+          ignoreBuildCache: opts.ignoreBuildCache,
+          ignoreDownloadCache: opts.ignoreDownloadCache,
+          forceArtifactBuild: opts.forceArtifactBuild,
+          keepTemp: opts.keepTemp,
+          system: opts.system,
+        });
+        await writeInstallState(app, "installed", { system: Boolean(opts.system) });
+      });
+      if (opts.system) {
+        console.log(`System install complete for '${app}'.`);
+      }
+    } catch (err) {
+      await writeInstallState(app, "failed", { reason: err instanceof Error ? err.message : String(err) }).catch(() => {});
+      error(`Install failed: ${app}`);
+      console.error(`Reason: ${err instanceof Error ? err.message : String(err)}`);
+      if (VERBOSITY - QUIET >= 2 && err instanceof Error && err.stack) {
+        console.error(err.stack);
+      }
+      Deno.exit(1);
+    }
   })
   .command("uninstall <app:string>", "Uninstall an app")
   .action(async (_opts, app) => { await uninstallApp(app); })
+  .command("run <app:string> <script:string>", "Run a package script")
+  .action(async (_opts, app, script) => { await runPackageScriptAction(app, script); })
   .command("bucket", new Command()
     .description("Manage buckets")
     .action(function () { this.showHelp(); })
@@ -741,5 +1585,10 @@ await new Command()
     } catch {
       console.log("Uname: not available");
     }
+  })
+  .command("doctor [topic:string]", "Check host compatibility for Scoopix packages")
+  .description("Available topics: host")
+  .action(async (_opts, topic) => {
+    await doctor(topic);
   })
   .parse(Deno.args);
