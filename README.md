@@ -31,12 +31,9 @@ deno run --allow-env https://raw.githubusercontent.com/raisercostin/scoopix/main
 > scoopix 0.1.0
 
 echo install scoopix and check version
-deno install --global  --allow-net --allow-run --allow-read --allow-write --allow-env https://raw.githubusercontent.com/raisercostin/scoopix/main/scoopix.ts
+deno install --global --allow-net --allow-run --allow-read --allow-write --allow-env https://raw.githubusercontent.com/raisercostin/scoopix/main/scoopix.ts
 scoopix --version
 > scoopix 0.1.0
-
-echo app installs automatically configure ~/.scoopix/bin and manpath when needed
-echo optional manual setup: scoopix init
 
 $ scoopix list
 main/fd - A simple, fast and user-friendly alternative to 'find'

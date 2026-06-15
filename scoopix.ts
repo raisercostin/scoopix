@@ -109,6 +109,13 @@ export interface ScoopixDocker {
   output: string;
 }
 
+export interface ScoopixVersionSource {
+  url: string;
+  type?: "github-releases" | "text";
+  versionRegex: string;
+  includePrerelease?: boolean;
+}
+
 export interface ScoopixApp {
   version: string;
   description?: string;
@@ -124,6 +131,7 @@ export interface ScoopixApp {
   extract?: "zip" | "tar.gz" | "tgz";
   bin?: ScoopixBinary;
   shim?: string;
+  versionSource?: ScoopixVersionSource;
   arch?: Record<string, ScoopixArchEntry>;
   docker?: ScoopixDocker;
 }
@@ -281,6 +289,78 @@ async function findApp(app: string): Promise<{ bucket: string; info: any } | nul
   }
 
   return null;
+}
+
+function compareVersionStrings(a: string, b: string): number {
+  const left = a.split(/[.-]/).map(part => Number.parseInt(part, 10));
+  const right = b.split(/[.-]/).map(part => Number.parseInt(part, 10));
+  const len = Math.max(left.length, right.length);
+  for (let i = 0; i < len; i++) {
+    const av = Number.isFinite(left[i]) ? left[i] : 0;
+    const bv = Number.isFinite(right[i]) ? right[i] : 0;
+    if (av !== bv) return av - bv;
+  }
+  return a.localeCompare(b);
+}
+
+function collectVersionsFromText(text: string, regexText: string): string[] {
+  const regex = new RegExp(regexText, "gm");
+  const versions = new Set<string>();
+  for (const match of text.matchAll(regex)) {
+    versions.add(match[1] ?? match[0]);
+  }
+  return [...versions].sort((a, b) => compareVersionStrings(b, a));
+}
+
+async function discoverVersions(appId: string, infoObj: ScoopixApp): Promise<string[]> {
+  const source = infoObj.versionSource;
+  if (!source) {
+    error(`versions: '${appId}' has no versionSource in the loaded manifest`);
+    console.error("Add versionSource to the bucket manifest, or refresh/use a bucket that contains it.");
+    Deno.exit(1);
+  }
+
+  const response = await fetch(source.url);
+  if (!response.ok) throw new Error(`versionSource fetch failed: HTTP ${response.status} ${response.statusText}`);
+  const text = await response.text();
+
+  if ((source.type ?? "text") === "github-releases") {
+    const releases = JSON.parse(text);
+    const tags = Array.isArray(releases)
+      ? releases
+        .filter(release => source.includePrerelease || (!release.draft && !release.prerelease))
+        .map(release => String(release.tag_name ?? ""))
+      : [String(releases.tag_name ?? "")];
+    return collectVersionsFromText(tags.filter(Boolean).join("\n"), source.versionRegex);
+  }
+
+  return collectVersionsFromText(text, source.versionRegex);
+}
+
+async function printVersions(app: string) {
+  const { appName, version, info: infoObj, bucket } = await resolveAppInfo(app);
+  const appId = `${bucket}/${appName}`;
+  const versions = await discoverVersions(appId, infoObj);
+  console.log(appId);
+  console.log(`manifest: ${version}`);
+  console.log(`latest:   ${versions[0] ?? "<none>"}`);
+  console.log(`versions: ${versions.join(", ")}`);
+}
+
+async function checkVersion(app: string) {
+  const { appName, version, info: infoObj, bucket } = await resolveAppInfo(app);
+  const appId = `${bucket}/${appName}`;
+  const versions = await discoverVersions(appId, infoObj);
+  const latest = versions[0];
+  if (!latest) {
+    console.log(`${appId}: no upstream versions found`);
+    return;
+  }
+  const cmp = compareVersionStrings(latest, version);
+  const status = cmp > 0 ? "outdated" : cmp === 0 ? "current" : "ahead";
+  console.log(`${appId}: ${status}`);
+  console.log(`manifest: ${version}`);
+  console.log(`latest:   ${latest}`);
 }
 async function downloadAndInstall(
   url: string,
@@ -571,15 +651,48 @@ async function detectHostArchKeys(): Promise<string[]> {
   return [...new Set(keys)];
 }
 
-async function uninstallApp(app: string) {
-  const { appName, info: infoObj } = await resolveAppInfo(app);
-  const dest = join(BIN_DIR, infoObj.shim ?? appName);
-  if (await exists(dest)) {
-    await Deno.remove(dest);
-    console.log(`Uninstalled '${app}' from ${dest}`);
-  } else {
-    console.error(`'${app}' is not installed.`);
+async function pathExistsNoFollow(path: string): Promise<boolean> {
+  try {
+    await Deno.lstat(path);
+    return true;
+  } catch (err) {
+    if (err instanceof Deno.errors.NotFound) return false;
+    throw err;
   }
+}
+
+async function removeIfPresent(path: string, opts: { recursive?: boolean } = {}): Promise<boolean> {
+  if (!(await pathExistsNoFollow(path))) return false;
+  await Deno.remove(path, { recursive: opts.recursive ?? false });
+  return true;
+}
+
+async function uninstallApp(app: string) {
+  const appName = app.includes("/") ? app.split("/").pop()! : app;
+  const found = await findApp(app);
+  const shimName = found?.info?.shim ?? appName;
+  const candidates = [...new Set([
+    join(BIN_DIR, shimName),
+    join(BIN_DIR, appName),
+    join(DEFAULT_BIN_DIR, shimName),
+    join(DEFAULT_BIN_DIR, appName),
+  ])];
+  const removed: string[] = [];
+
+  for (const candidate of candidates) {
+    if (await removeIfPresent(candidate)) removed.push(candidate);
+  }
+
+  const appDir = join(APPS_DIR, appName);
+  if (await removeIfPresent(appDir, { recursive: true })) removed.push(appDir);
+
+  if (removed.length === 0) {
+    console.error(`'${app}' is not installed.`);
+    return;
+  }
+
+  console.log(`Uninstalled '${app}':`);
+  for (const path of removed) console.log(`  removed ${path}`);
 }
 async function buildFromSource(
   app: string,
@@ -1601,6 +1714,14 @@ await new Command()
   .option("--full", "Show full bucket path")
   .action(async (cliOpts) => {
     await listApps(cliOpts.full ?? false);
+  })
+  .command("versions <app:string>", "List upstream versions for an app")
+  .action(async (_opts, app) => {
+    await printVersions(app);
+  })
+  .command("checkver <app:string>", "Check whether an app manifest is current")
+  .action(async (_opts, app) => {
+    await checkVersion(app);
   })
   .command("init [shell:string]", "Configure PATH in shell rc file")
   .action(async (_opts, shell) => {

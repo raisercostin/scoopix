@@ -48,6 +48,11 @@
     "homepage": "https://micro-editor.github.io/",
     "license": "MIT",
     "type": "bin",
+    "versionSource": {
+      "url": "https://api.github.com/repos/zyedidia/micro/releases",
+      "type": "github-releases",
+      "versionRegex": "^v?(\\d+\\.\\d+\\.\\d+)$"
+    },
     "arch": {
       "x86_64": {
         "url": "https://github.com/zyedidia/micro/releases/download/v2.0.13/micro-2.0.13-linux64.tar.gz",
