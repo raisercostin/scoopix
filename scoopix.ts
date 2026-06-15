@@ -39,6 +39,7 @@ const STATE_DIR = join(SCOOPIX_HOME, "state");
 const LOCKS_DIR = join(SCOOPIX_HOME, "locks");
 const SCOOPIX_SYSTEM_COMMAND = "sudo scoopix";
 const SCOOPIX_EXPORT_LINE = `export PATH="$HOME/.scoopix/bin:$PATH"\nexport MANPATH="$HOME/.scoopix/share/man:$MANPATH"`;
+const DEFAULT_MAIN_BUCKET_URL = "https://raw.githubusercontent.com/raisercostin/scoopix/main/scoopix-main.json";
 
 let VERBOSITY = 1
 let QUIET = 0
@@ -137,6 +138,22 @@ async function listBuckets(): Promise<{ name: string, path: string }[]> {
   return Object.entries(cfg.buckets ?? {}).map(([name, path]) => ({ name, path }));
 }
 
+async function ensureDefaultMainBucket(): Promise<void> {
+  await ensureDir(SCOOPIX_HOME);
+  await chownToSudoUser(SCOOPIX_HOME);
+  const cfgPath = join(SCOOPIX_HOME, "config.json");
+  let cfg = { buckets: {} as Record<string, string> };
+  if (await exists(cfgPath)) {
+    cfg = JSON.parse(await Deno.readTextFile(cfgPath));
+    cfg.buckets ??= {};
+  }
+  if (cfg.buckets.main) return;
+  cfg.buckets.main = DEFAULT_MAIN_BUCKET_URL;
+  await Deno.writeTextFile(cfgPath, JSON.stringify(cfg, null, 2));
+  await chownToSudoUser(cfgPath);
+  status(`Configured default bucket 'main' -> ${DEFAULT_MAIN_BUCKET_URL}`);
+}
+
 async function addBucket(url: string, name?: string) {
   await ensureDir(SCOOPIX_HOME);
   const cfgPath = join(SCOOPIX_HOME, "config.json");
@@ -227,6 +244,7 @@ async function loadBucket(name: string, path: string): Promise<BucketManifest | 
 async function loadAllBuckets(): Promise<Map<string, BucketManifest>> {
   info(`Loading buckets from config in ${SCOOPIX_HOME}`);
   const buckets = new Map<string, BucketManifest>();
+  await ensureDefaultMainBucket();
   const entries = await listBuckets();
 
   if (entries.length === 0) {
@@ -1574,6 +1592,7 @@ await new Command()
     .action(async (_opts, url, name) => { await addBucket(url, name); })
     .command("list", "List available buckets")
     .action(async () => {
+      await ensureDefaultMainBucket();
       const buckets = await listBuckets();
       for (const b of buckets) console.log(b);
     })

@@ -75,19 +75,21 @@ Commands:
 
 ### Example: Install `micro` editor on Synology/Entware
 
-1. Add a bucket
+The default `main` bucket is configured automatically on first `list`, `install`, or package script run.
+To override it manually:
+
 ```bash
 $ scoopix bucket add https://raw.githubusercontent.com/raisercostin/scoopix/main/scoopix-main.json main
 Added bucket 'main' -> https://raw.githubusercontent.com/raisercostin/scoopix/main/scoopix-main.json
 ```
 
-3. Install micro:
+Install micro:
 
 ```bash
 scoopix install main/micro
 ```
 
-4. Run it:
+Run it:
 
 ```bash
 micro
@@ -133,7 +135,7 @@ See [WIREGUARD.md](WIREGUARD.md) for the full Synology install, test, router, cl
 
 ## 📖 History
 
-* **2026-06-15** – Added the full Synology WireGuard path: generic host/DSM doctor data, source-built `wireguard-tools`, source-built Synology kernel-module SPK, system install/start checks, safe local and remote peer tests, `wg` command metadata in `list`, and one-line `sudo scoopix install main/wireguard --system`.
+* **2026-06-15** – Added the full Synology WireGuard path: generic host/DSM doctor data, source-built `wireguard-tools`, source-built Synology kernel-module SPK, system install/start checks, safe local and remote peer tests, `wg` command metadata in `list`, automatic path/manpath initialization, automatic default `main` bucket setup, and one-line `sudo scoopix install main/wireguard --system`.
 * **2025-09-07** – v0.1.0 - Initial release inspired by Scoop, focused on Synology/Entware.
 * Added features:
   * Source builds via Docker
