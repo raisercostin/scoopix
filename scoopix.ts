@@ -39,7 +39,10 @@ const STATE_DIR = join(SCOOPIX_HOME, "state");
 const LOCKS_DIR = join(SCOOPIX_HOME, "locks");
 const SCOOPIX_SYSTEM_COMMAND = "sudo scoopix";
 const SCOOPIX_EXPORT_LINE = `export PATH="$HOME/.scoopix/bin:$PATH"\nexport MANPATH="$HOME/.scoopix/share/man:$MANPATH"`;
-const DEFAULT_MAIN_BUCKET_URL = "https://raw.githubusercontent.com/raisercostin/scoopix/main/scoopix-main.json";
+const DEFAULT_MAIN_BUCKET_URL = "https://github.com/raisercostin/scoopix/raw/refs/heads/main/scoopix-main.json";
+const LEGACY_MAIN_BUCKET_URLS = [
+  "https://raw.githubusercontent.com/raisercostin/scoopix/main/scoopix-main.json",
+];
 
 let VERBOSITY = 1
 let QUIET = 0
@@ -155,11 +158,12 @@ async function ensureDefaultMainBucket(): Promise<void> {
     cfg = JSON.parse(await Deno.readTextFile(cfgPath));
     cfg.buckets ??= {};
   }
-  if (cfg.buckets.main) return;
+  if (cfg.buckets.main && !LEGACY_MAIN_BUCKET_URLS.includes(cfg.buckets.main)) return;
+  const action = cfg.buckets.main ? "Updated" : "Configured";
   cfg.buckets.main = DEFAULT_MAIN_BUCKET_URL;
   await Deno.writeTextFile(cfgPath, JSON.stringify(cfg, null, 2));
   await chownToSudoUser(cfgPath);
-  status(`Configured default bucket 'main' -> ${DEFAULT_MAIN_BUCKET_URL}`);
+  status(`${action} default bucket 'main' -> ${DEFAULT_MAIN_BUCKET_URL}`);
 }
 
 async function addBucket(url: string, name?: string) {

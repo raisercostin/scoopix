@@ -76,8 +76,8 @@ The default `main` bucket is configured automatically on first `list`, `install`
 To override it manually:
 
 ```bash
-$ scoopix bucket add https://raw.githubusercontent.com/raisercostin/scoopix/main/scoopix-main.json main
-Added bucket 'main' -> https://raw.githubusercontent.com/raisercostin/scoopix/main/scoopix-main.json
+$ scoopix bucket add https://github.com/raisercostin/scoopix/raw/refs/heads/main/scoopix-main.json main
+Added bucket 'main' -> https://github.com/raisercostin/scoopix/raw/refs/heads/main/scoopix-main.json
 ```
 
 Install micro:
