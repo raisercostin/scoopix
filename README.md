@@ -36,10 +36,6 @@ This makes it perfect for systems where you don’t want or can’t use `apt`, `
 echo install deno - see https://docs.deno.com/runtime/getting_started/installation/
 curl -fsSL https://deno.land/install.sh | sh
 
-echo run scoopix without installing
-deno run https://raw.githubusercontent.com/raisercostin/scoopix/main/scoopix.ts
-> usage...
-
 echo run scoopix --version without installing
 deno run --allow-env https://raw.githubusercontent.com/raisercostin/scoopix/main/scoopix.ts --version
 > ✅ Granted env access to "HOME".
@@ -114,7 +110,7 @@ micro
 ### Example: Install `rhash` from source
 
 ```bash
-scoopix install dev/rhash
+scoopix install main/rhash
 ```
 
 Scoopix will:
@@ -129,7 +125,7 @@ Scoopix will:
 Scoopix can install WireGuard on Synology in one line after `scoopix` is installed with the Deno permissions it needs:
 
 ```sh
-scoopix install main/wireguard && sudo scoopix install main/wireguard --system
+sudo scoopix install main/wireguard --system
 ```
 
 This builds the `wg` userspace tool from `wireguard-tools`, builds the Synology kernel-module SPK in Docker using Synology toolkit tarballs for the detected DSM/platform, and uses the open `vegardit/synology-wireguard` packaging recipe instead of an opaque binary SPK.
@@ -138,6 +134,7 @@ See [WIREGUARD.md](WIREGUARD.md) for the full Synology install, test, router, cl
 
 ## 📖 History
 
+* **2026-06-15** – Added one-line Synology WireGuard install via `main/wireguard`, with `wg` shown as a provided command.
 * **2025-09-07** – v0.1.0 - Initial release inspired by Scoop, focused on Synology/Entware.
 * Added features:
   * Source builds via Docker

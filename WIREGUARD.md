@@ -6,8 +6,8 @@ This guide describes the path validated on a Synology DSM 7.x NAS. It installs t
 
 Scoopix installs two pieces:
 
-- `wg`: the WireGuard userspace configuration tool, installed under `~/.scoopix/bin/wg`.
-- `wireguard-kmod-spk`: a Synology SPK that loads the WireGuard kernel module.
+- `wireguard-tools`: the package that installs the `wg` userspace configuration tool under `~/.scoopix/bin/wg`.
+- `synology-wireguard-kmod-spk`: a Synology SPK that loads the WireGuard kernel module.
 
 The combined package is:
 
@@ -35,16 +35,10 @@ UDP 51820 -> <nas-lan-ip>:51820
 After `scoopix` is installed with Deno permissions, install everything in one line:
 
 ```sh
-scoopix install main/wireguard && sudo scoopix install main/wireguard --system
+sudo scoopix install main/wireguard --system
 ```
 
-If running directly from a source checkout, build or reuse the artifacts as the normal user:
-
-```sh
-deno run --allow-read --allow-write --allow-net --allow-env --allow-run scoopix.ts install main/wireguard
-```
-
-Run the system install/start step with root:
+If running directly from a source checkout, use the same single-step flow with `deno run`:
 
 ```sh
 sudo deno run --allow-read --allow-write --allow-net --allow-env --allow-run scoopix.ts install main/wireguard --system

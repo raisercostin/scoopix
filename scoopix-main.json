@@ -139,12 +139,15 @@
       }
     }
   },
-  "wg": {
+  "wireguard-tools": {
     "version": "1.0.20210914",
-    "description": "WireGuard configuration utility",
+    "description": "WireGuard userspace tool",
+    "provides": ["wg"],
     "homepage": "https://www.wireguard.com/",
     "license": "GPL-2.0",
     "type": "src",
+    "bin": "wg",
+    "shim": "wg",
     "url": "https://git.zx2c4.com/wireguard-tools/snapshot/wireguard-tools-1.0.20210914.tar.xz",
     "docker": {
       "image": "alpine:edge",
@@ -162,12 +165,13 @@
   "wireguard": {
     "version": "1.0.20220627-dsm7.2",
     "description": "WireGuard userspace tools and Synology kernel module",
+    "provides": ["wg"],
     "homepage": "https://www.wireguard.com/",
     "license": "GPL-2.0",
     "type": "meta",
     "depends": [
-      "wg",
-      "wireguard-kmod-spk"
+      "wireguard-tools",
+      "synology-wireguard-kmod-spk"
     ],
     "scripts": {
       "test1": [
@@ -190,9 +194,9 @@
       ]
     }
   },
-  "wireguard-kmod-spk": {
+  "synology-wireguard-kmod-spk": {
     "version": "1.0.20220627-dsm7.2",
-    "description": "Synology WireGuard kernel module SPK builder",
+    "description": "Synology WireGuard kernel module SPK",
     "homepage": "https://github.com/vegardit/synology-wireguard",
     "license": "MIT",
     "base": {

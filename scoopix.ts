@@ -110,6 +110,7 @@ export interface ScoopixDocker {
 export interface ScoopixApp {
   version: string;
   description?: string;
+  provides?: string[];
   homepage?: string;
   license?: string;
   vars?: Record<string, string | number | boolean>;
@@ -120,6 +121,7 @@ export interface ScoopixApp {
   urls?: string[];
   extract?: "zip" | "tar.gz" | "tgz";
   bin?: ScoopixBinary;
+  shim?: string;
   arch?: Record<string, ScoopixArchEntry>;
   docker?: ScoopixDocker;
 }
@@ -165,10 +167,11 @@ async function listApps(full: boolean) {
     for (const [app, meta] of Object.entries(manifest)) {
       const appName = full ? `${bucket}/${app}` : `${bucket}/${app}`;
       const description = meta.description ?? "";
+      const provides = meta.provides?.length ? ` (provides: ${meta.provides.join(", ")})` : "";
       if (description) {
-        console.log(`${appName} - ${description}`);
+        console.log(`${appName} - ${description}${provides}`);
       } else {
-        console.log(appName);
+        console.log(`${appName}${provides}`);
       }
     }
   }
@@ -414,13 +417,13 @@ async function installFromDelegated(infoObj: ScoopixApp, appName: string) {
   }
 }
 
-async function linkAppBinaries(appName: string, version: string, binName: string) {
+async function linkAppBinaries(appName: string, version: string, binName: string, shimName = appName) {
   const currentLink = join(APPS_DIR, appName, "current");
   try { await Deno.remove(currentLink, { recursive: true }); } catch { }
   await Deno.symlink(join(APPS_DIR, appName, version), currentLink, { type: "dir" });
 
   await ensureDir(BIN_DIR);
-  const binPath = join(BIN_DIR, appName);
+  const binPath = join(BIN_DIR, shimName);
   try { await Deno.remove(binPath); } catch { }
   const shimTarget = join(currentLink, "bin", binName);
   await Deno.symlink(shimTarget, binPath, { type: "file" });
@@ -428,8 +431,8 @@ async function linkAppBinaries(appName: string, version: string, binName: string
   console.log(`Installed '${appName}' -> ${binPath} (-> ${shimTarget})`);
 }
 
-async function isAppLinked(appName: string, version: string, binName: string): Promise<boolean> {
-  const binPath = join(BIN_DIR, appName);
+async function isAppLinked(appName: string, version: string, binName: string, shimName = appName): Promise<boolean> {
+  const binPath = join(BIN_DIR, shimName);
   const shimTarget = join(APPS_DIR, appName, "current", "bin", binName);
   try {
     return await Deno.realPath(binPath) === await Deno.realPath(shimTarget);
@@ -495,18 +498,19 @@ async function installApp(app: string, opts: any = {}) {
   }
 
   const binName = infoObj.bin?.toString() ?? appName;
+  const shimName = infoObj.shim ?? appName;
   const { dest } = await prepareAppDirectories(appName, version, binName);
   const canUseInstalled = !installOpts.ignoreBuildCache && !installOpts.ignoreDownloadCache;
 
   if (canUseInstalled && await exists(dest)) {
-    if (await isAppLinked(appName, version, binName)) {
+    if (await isAppLinked(appName, version, binName, shimName)) {
       if (!installOpts.suppressOutput) {
         console.log(`Already installed: ${appName} ${version}.`);
         await verifyEnvPaths();
       }
       return;
     }
-    await linkAppBinaries(appName, version, binName);
+    await linkAppBinaries(appName, version, binName, shimName);
     if (!installOpts.suppressOutput) {
       console.log(`Relinked existing: ${appName} ${version}.`);
       await verifyEnvPaths();
@@ -523,7 +527,7 @@ async function installApp(app: string, opts: any = {}) {
     await installFromBinary(infoObj, dest, opts);
   }
 
-  await linkAppBinaries(appName, version, binName);
+  await linkAppBinaries(appName, version, binName, shimName);
   if (!installOpts.suppressOutput) {
     await verifyEnvPaths();
   }
@@ -571,7 +575,8 @@ async function detectHostArchKeys(): Promise<string[]> {
 }
 
 async function uninstallApp(app: string) {
-  const dest = join(DEFAULT_BIN_DIR, app);
+  const { appName, info: infoObj } = await resolveAppInfo(app);
+  const dest = join(BIN_DIR, infoObj.shim ?? appName);
   if (await exists(dest)) {
     await Deno.remove(dest);
     console.log(`Uninstalled '${app}' from ${dest}`);
