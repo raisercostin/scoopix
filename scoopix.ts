@@ -38,6 +38,7 @@ const ARTIFACTS_DIR = join(SCOOPIX_HOME, "artifacts");
 const STATE_DIR = join(SCOOPIX_HOME, "state");
 const LOCKS_DIR = join(SCOOPIX_HOME, "locks");
 const SCOOPIX_SYSTEM_COMMAND = "sudo scoopix";
+const SCOOPIX_EXPORT_LINE = `export PATH="$HOME/.scoopix/bin:$PATH"\nexport MANPATH="$HOME/.scoopix/share/man:$MANPATH"`;
 
 let VERBOSITY = 1
 let QUIET = 0
@@ -442,29 +443,7 @@ async function isAppLinked(appName: string, version: string, binName: string, sh
 }
 
 async function verifyEnvPaths() {
-  const currentPath = Deno.env.get("PATH") ?? "";
-  if (!currentPath.split(":").includes(BIN_DIR)) {
-    const suggestions = await detectShellInits();
-    const lines = formatShellInits(suggestions);
-    warn(`${BIN_DIR} is not in your PATH.`);
-    console.error(
-      `You won’t be able to run installed tools until you update PATH.\n\n` +
-      `Option 1 (manual): add this line to your shell profile:\n\n` +
-      `  export PATH="$HOME/.scoopix/bin:$PATH"\n\n` +
-      `Then restart your shell or run 'source <file>'.\n\n` +
-      `Option 2: let Scoopix set it up automatically:\n\n${lines.join("\n")}\n`
-    );
-  }
-
-  const currentManpath = Deno.env.get("MANPATH") ?? "";
-  const scoopixMan = join(SCOOPIX_HOME, "share", "man");
-  if (!currentManpath.split(":").includes(scoopixMan)) {
-    warn(`${scoopixMan} is not in your MANPATH.`);
-    console.error(
-      `To use 'man <app>', add this line to your shell profile:\n\n` +
-      `  export MANPATH="$HOME/.scoopix/share/man:$MANPATH"\n`
-    );
-  }
+  await ensureScoopixInitialized();
 }
 
 async function installApp(app: string, opts: any = {}) {
@@ -1184,7 +1163,7 @@ type ShellInitSuggestion = {
 };
 
 async function detectShellInits(): Promise<ShellInitSuggestion[]> {
-  const home = Deno.env.get("HOME") ?? ".";
+  const home = USER_HOME;
   const results: ShellInitSuggestion[] = [];
 
   for (const [shell, files] of Object.entries(SHELL_RC_MAP)) {
@@ -1215,7 +1194,19 @@ function formatShellInits(suggestions: ShellInitSuggestion[]): string[] {
     return `  scoopix init ${s.shell}   # ${note}`;
   });
 }
-async function initShell(shellArg?: string) {
+
+async function chownToSudoUser(path: string) {
+  const uid = Deno.env.get("SUDO_UID");
+  const gid = Deno.env.get("SUDO_GID");
+  if (!uid || !gid || !(await isRootUser())) return;
+  try {
+    await Deno.chown(path, Number(uid), Number(gid));
+  } catch (err) {
+    warn(`Could not restore ownership of ${path}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+async function initShell(shellArg?: string, opts: { quietAlready?: boolean; auto?: boolean } = {}) {
   let shell = shellArg;
   if (!shell) {
     // fallback to current shell from $SHELL
@@ -1231,41 +1222,58 @@ async function initShell(shellArg?: string) {
     info(`initShell: shell argument provided: '${shell}'`);
   }
 
-  const exportLine = `export PATH="$HOME/.scoopix/bin:$PATH"\nexport MANPATH="$HOME/.scoopix/share/man:$MANPATH"`;
-  const home = Deno.env.get("HOME") ?? ".";
+  const home = USER_HOME;
   const suggestions = await detectShellInits();
   const found = suggestions.find(s => s.shell === shell);
 
   if (!found) {
-    error(`Unsupported or undetected shell: ${shell}`);
-    console.error(`Supported shells: ${Object.keys(SHELL_RC_MAP).join(", ")}`);
-    Deno.exit(1);
+    if (opts.auto && suggestions.length > 0) {
+      shell = suggestions[0].shell;
+      info(`initShell: using detected shell '${shell}' for automatic initialization`);
+    } else {
+      error(`Unsupported or undetected shell: ${shell}`);
+      console.error(`Supported shells: ${Object.keys(SHELL_RC_MAP).join(", ")}`);
+      Deno.exit(1);
+    }
   }
 
-  const rcFile = join(home, found.recommended);
+  const selected = suggestions.find(s => s.shell === shell)!;
+  const rcFile = join(home, selected.recommended);
 
-  await ensureDir(join(rcFile, ".."));
+  await ensureDir(dirname(rcFile));
 
   let already = false;
   try {
     const contents = await Deno.readTextFile(rcFile);
-    if (contents.includes(exportLine)) already = true;
+    if (contents.includes(SCOOPIX_EXPORT_LINE)) already = true;
   } catch {
     // file may not exist yet
   }
 
   if (already) {
     info(`PATH already configured in ${rcFile}`);
-    console.log(`Scoopix is already initialized for ${shell} (see ${rcFile})`);
+    if (!opts.quietAlready) {
+      console.log(`Scoopix is already initialized for ${shell} (see ${rcFile})`);
+    }
   } else {
-    await Deno.writeTextFile(rcFile, `\n# Added by Scoopix\n${exportLine}\n`, { append: true });
+    await Deno.writeTextFile(rcFile, `\n# Added by Scoopix\n${SCOOPIX_EXPORT_LINE}\n`, { append: true });
+    await chownToSudoUser(rcFile);
     info(`Appended PATH export to ${rcFile}`);
-    console.log(`Configured Scoopix for ${shell}. Modified ${rcFile}:\n  ${exportLine}`);
-    if (found.alternates.length > 0) {
-      console.log(`Note: other candidate files also exist: ${found.alternates.join(", ")}`);
+    console.log(`Configured Scoopix for ${shell}. Modified ${rcFile}:\n  ${SCOOPIX_EXPORT_LINE}`);
+    if (selected.alternates.length > 0) {
+      console.log(`Note: other candidate files also exist: ${selected.alternates.join(", ")}`);
     }
     console.log(`Run 'source ${rcFile}' or restart your shell to activate.`);
   }
+}
+
+async function ensureScoopixInitialized() {
+  const currentPath = Deno.env.get("PATH") ?? "";
+  const currentManpath = Deno.env.get("MANPATH") ?? "";
+  const pathOk = currentPath.split(":").includes(BIN_DIR);
+  const manOk = currentManpath.split(":").includes(join(SCOOPIX_HOME, "share", "man"));
+  if (pathOk && manOk) return;
+  await initShell(undefined, { quietAlready: true, auto: true });
 }
 
 type DoctorCheck = {
@@ -1539,6 +1547,7 @@ await new Command()
           keepTemp: opts.keepTemp,
           system: opts.system,
         });
+        await ensureScoopixInitialized();
         await writeInstallState(app, "installed", { system: Boolean(opts.system) });
       });
       if (opts.system) {

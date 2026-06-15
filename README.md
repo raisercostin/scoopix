@@ -17,20 +17,9 @@ This makes it perfect for systems where you don’t want or can’t use `apt`, `
 - **Shims directory (`~/.scoopix/bin`)** – added to `PATH`, just like Scoop’s `shims`.
 - **Man page support** – installs `man` pages into `~/.scoopix/share/man`.
 
-## 📂 Directory Layout
-
-```
-~/.scoopix/
-  ├── apps/       # per-app, per-version installs
-  │   └── micro/2.0.13/bin/micro
-  ├── bin/        # shims → apps/<name>/current/bin/<binary>
-  ├── buckets/    # user buckets (JSON manifests)
-  ├── cache/      # downloaded tarballs, source archives
-  ├── share/man/  # installed man pages
-  └── temp/       # build/extraction scratch, symlinked to temp, usually clean
-```
-
 ## Install Scoopix
+
+Scoopix uses deno - The typescript runtime and toolchain.
 
 ```bash
 echo install deno - see https://docs.deno.com/runtime/getting_started/installation/
@@ -46,8 +35,14 @@ deno install --global  --allow-net --allow-run --allow-read --allow-write --allo
 scoopix --version
 > scoopix 0.1.0
 
-echo configure path and manpath
-scoopix init
+echo app installs automatically configure ~/.scoopix/bin and manpath when needed
+echo optional manual setup: scoopix init
+
+$ scoopix list
+main/fd - A simple, fast and user-friendly alternative to 'find'
+main/rhash - Utility for computing and verifying hash sums
+main/micro - A terminal-based text editor that feels like a modern IDE
+main/wireguard - WireGuard userspace tools and Synology kernel module
 ```
 
 ## 🛠 Usage
@@ -84,15 +79,6 @@ Commands:
 ```bash
 $ scoopix bucket add https://raw.githubusercontent.com/raisercostin/scoopix/main/scoopix-main.json main
 Added bucket 'main' -> https://raw.githubusercontent.com/raisercostin/scoopix/main/scoopix-main.json
-```
-
-2. List apps
-
-```bash
-$ scoopix list
-main/fd - A simple, fast and user-friendly alternative to 'find'
-main/rhash - Utility for computing and verifying hash sums
-main/micro - A terminal-based text editor that feels like a modern IDE
 ```
 
 3. Install micro:
@@ -132,9 +118,22 @@ This builds the `wg` userspace tool from `wireguard-tools`, builds the Synology 
 
 See [WIREGUARD.md](WIREGUARD.md) for the full Synology install, test, router, client, and permanent-server notes.
 
+## 📂 Directory Layout
+
+```
+~/.scoopix/
+  ├── apps/       # per-app, per-version installs
+  │   └── micro/2.0.13/bin/micro
+  ├── bin/        # shims → apps/<name>/current/bin/<binary>
+  ├── buckets/    # user buckets (JSON manifests)
+  ├── cache/      # downloaded tarballs, source archives
+  ├── share/man/  # installed man pages
+  └── temp/       # build/extraction scratch, symlinked to temp, usually clean
+```
+
 ## 📖 History
 
-* **2026-06-15** – Added one-line Synology WireGuard install via `main/wireguard`, with `wg` shown as a provided command.
+* **2026-06-15** – Added the full Synology WireGuard path: generic host/DSM doctor data, source-built `wireguard-tools`, source-built Synology kernel-module SPK, system install/start checks, safe local and remote peer tests, `wg` command metadata in `list`, and one-line `sudo scoopix install main/wireguard --system`.
 * **2025-09-07** – v0.1.0 - Initial release inspired by Scoop, focused on Synology/Entware.
 * Added features:
   * Source builds via Docker
