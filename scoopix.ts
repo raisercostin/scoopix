@@ -37,7 +37,7 @@ const TEMP_DIR = join(SCOOPIX_HOME, "temp");
 const ARTIFACTS_DIR = join(SCOOPIX_HOME, "artifacts");
 const STATE_DIR = join(SCOOPIX_HOME, "state");
 const LOCKS_DIR = join(SCOOPIX_HOME, "locks");
-const DENO_RUN_FLAGS = "--allow-read --allow-write --allow-net --allow-env --allow-run";
+const SCOOPIX_SYSTEM_COMMAND = "sudo scoopix";
 
 let VERBOSITY = 1
 let QUIET = 0
@@ -1074,7 +1074,7 @@ async function installArtifact(appName: string, version: string, infoObj: any, o
       if (!(await isRootUser())) {
         error(`installArtifact: --system requires root for '${appName}'`);
         console.error("To install system-wide, start the command with sudo:");
-        console.error(`  sudo deno run ${DENO_RUN_FLAGS} scoopix-dev.ts install ${requestedApp} --system`);
+        console.error(`  ${SCOOPIX_SYSTEM_COMMAND} install ${requestedApp} --system`);
         Deno.exit(1);
       }
       await runManifestCommands(infoObj.systemCommands, placeholders, `system ${appName}`, workDir);
@@ -1092,7 +1092,7 @@ async function installArtifact(appName: string, version: string, infoObj: any, o
       if (!opts.suppressOutput) {
         warn(`installArtifact: '${appName}' was built only; system install commands were not run.`);
         console.log("To install system-wide, run:");
-        console.log(`  sudo deno run ${DENO_RUN_FLAGS} scoopix-dev.ts install ${requestedApp} --system`);
+        console.log(`  ${SCOOPIX_SYSTEM_COMMAND} install ${requestedApp} --system`);
       }
     } else {
       if (!opts.suppressOutput) {
@@ -1524,7 +1524,7 @@ await new Command()
         if (opts.system && !(await isRootUser())) {
           error(`install: --system requires root for '${app}'`);
           console.error("To install system-wide, start the command with sudo:");
-          console.error(`  sudo deno run ${DENO_RUN_FLAGS} scoopix-dev.ts install ${app} --system`);
+          console.error(`  ${SCOOPIX_SYSTEM_COMMAND} install ${app} --system`);
           Deno.exit(1);
         }
         await installApp(app, {
