@@ -1,7 +1,7 @@
 #!/usr/bin/env -S deno run --allow-net --allow-read --allow-write --allow-env --allow-run
 import { ensureDir } from "https://deno.land/std@0.224.0/fs/ensure_dir.ts";
 import { exists } from "https://deno.land/std@0.224.0/fs/exists.ts";
-import { join, dirname, basename } from "https://deno.land/std@0.224.0/path/mod.ts";
+import { join, dirname, basename, isAbsolute } from "https://deno.land/std@0.224.0/path/mod.ts";
 import { Command } from "https://deno.land/x/cliffy@v1.0.0-rc.4/command/mod.ts";
 
 function passwdHome(user: string): string | null {
@@ -177,7 +177,7 @@ async function addBucket(url: string, name?: string) {
   const bucketName = name || url.split("/").pop()?.replace(/\.json$/, "") || "bucket";
   const absPath = url.startsWith("http://") || url.startsWith("https://")
     ? url
-    : join(Deno.cwd(), url);
+    : isAbsolute(url) ? url : join(Deno.cwd(), url);
 
   cfg.buckets[bucketName] = absPath;
   await Deno.writeTextFile(cfgPath, JSON.stringify(cfg, null, 2));
