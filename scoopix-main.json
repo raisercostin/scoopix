@@ -53,7 +53,18 @@
       "type": "github-releases",
       "versionRegex": "^v?(\\d+\\.\\d+\\.\\d+)$"
     },
+    "healthcheck": {
+      "command": "{target}",
+      "args": ["--version"],
+      "match": "Version: {version}"
+    },
     "arch": {
+      "windows-x86_64": {
+        "url": "https://github.com/zyedidia/micro/releases/download/v2.0.13/micro-2.0.13-win64.zip",
+        "extract": "zip",
+        "bin": "micro-2.0.13/micro.exe",
+        "man": "micro-2.0.13/micro.1"
+      },
       "x86_64": {
         "url": "https://github.com/zyedidia/micro/releases/download/v2.0.13/micro-2.0.13-linux64.tar.gz",
         "extract": "tar.gz",
