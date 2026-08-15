@@ -85,6 +85,60 @@
       }
     }
   },
+  "arangodb": {
+    "version": "3.11.14",
+    "description": "ArangoDB - a multi-model database",
+    "homepage": "https://www.arangodb.com/",
+    "license": "Apache-2.0",
+    "type": "bin",
+    "versionSource": {
+      "url": "https://download.arangodb.com/arangodb311/Community/Windows/",
+      "versionRegex": "ArangoDB3-(3\\.11\\.\\d+(?:-\\d+)?)_win64\\.zip"
+    },
+    "arch": {
+      "windows-x86_64": {
+        "url": "https://download.arangodb.com/arangodb311/Community/Windows/ArangoDB3-3.11.14_win64.zip",
+        "extract": "zip",
+        "extractRoot": "ArangoDB3-3.11.14_win64",
+        "bin": [
+          "usr/bin/arangobench.exe",
+          "usr/bin/arangodump.exe",
+          "usr/bin/arangoimport.exe",
+          "usr/bin/arangorestore.exe",
+          "usr/bin/arangovpack.exe",
+          "usr/bin/arangod.exe",
+          "usr/bin/arangoexport.exe",
+          "usr/bin/arango-init-database.exe",
+          "usr/bin/arango-secure-installation.exe",
+          "usr/bin/foxx-manager.exe",
+          "usr/bin/arangodb.exe",
+          "usr/bin/arangoimp.exe",
+          "usr/bin/arangoinspect.exe",
+          "usr/bin/arangosh.exe"
+        ]
+      }
+    }
+  },
+  "arangodb312-linux-generic": {
+    "version": "3.12.4-3",
+    "description": "ArangoDB 3.12 Linux generic tarball for Linux/WSL targets",
+    "homepage": "https://www.arangodb.com/",
+    "license": "Apache-2.0",
+    "type": "bin",
+    "versionSource": {
+      "url": "https://download.arangodb.com/arangodb312/Community/Linux/index.html",
+      "versionRegex": "arangodb3-linux-(3\\.12\\.\\d+(?:-\\d+)?)_x86_64\\.tar\\.gz"
+    },
+    "arch": {
+      "linux-x86_64": {
+        "url": "https://download.arangodb.com/arangodb312/Community/Linux/arangodb3-linux-3.12.4-3_x86_64.tar.gz",
+        "extract": "tar.gz",
+        "extractRoot": "arangodb3-linux-3.12.4-3_x86_64",
+        "bin": "usr/bin/arangosh",
+        "shim": "arangosh312-linux"
+      }
+    }
+  },
   "bcat": {
     "version": "0.6.2",
     "type": "src",

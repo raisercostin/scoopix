@@ -17,28 +17,52 @@ This makes it perfect for systems where you don’t want or can’t use `apt`, `
 - **Shims directory (`~/.scoopix/bin`)** – holds app command shims, just like Scoop’s `shims`.
 - **Man page support** – installs `man` pages into `~/.scoopix/share/man`.
 
-## Install Scoopix
+## Install / Dev Usage
 
-Scoopix uses deno - The typescript runtime and toolchain.
+Use `deno install` instead of wrapper scripts. Install Deno first with the official instructions: https://docs.deno.com/runtime/getting_started/installation/. On Unix-like systems, the quick installer is `curl -fsSL https://deno.land/install.sh | sh`.
+
+Source: https://github.com/raisercostin/scoopix/blob/main/scoopix.ts
+
+- Public one-shot:
+
+  ```bash
+  deno run --allow-all https://github.com/raisercostin/scoopix/raw/refs/heads/main/scoopix.ts --version
+  ```
+
+- Public install:
+
+  ```bash
+  deno install --allow-all --force --name=scoopix https://github.com/raisercostin/scoopix/raw/refs/heads/main/scoopix.ts
+  scoopix --version
+  ```
+
+- Dev install:
+
+  ```bash
+  deno install --allow-all --force --name=scoopix $PWD/scoopix.ts
+  scoopix --version
+  ```
+
+- Dev local:
+
+  ```bash
+  deno run --allow-all scoopix.ts --version
+  ```
+
+- Suggested development bucket:
+
+  ```bash
+  scoopix bucket add ./scoopix-main.json dev
+  ```
+
+After installing, check the bundled bucket:
 
 ```bash
-echo install deno - see https://docs.deno.com/runtime/getting_started/installation/
-curl -fsSL https://deno.land/install.sh | sh
-
-echo run scoopix --version without installing
-deno run --allow-env https://raw.githubusercontent.com/raisercostin/scoopix/main/scoopix.ts --version
-> ✅ Granted env access to "HOME".
-> scoopix 0.1.0
-
-echo install scoopix and check version
-deno install --global --allow-net --allow-run --allow-read --allow-write --allow-env https://raw.githubusercontent.com/raisercostin/scoopix/main/scoopix.ts
-scoopix --version
-> scoopix 0.1.0
-
-$ scoopix list
+scoopix list
 main/fd - A simple, fast and user-friendly alternative to 'find'
 main/rhash - Utility for computing and verifying hash sums
 main/micro - A terminal-based text editor that feels like a modern IDE
+main/arangodb - ArangoDB - a multi-model database
 main/wireguard - WireGuard userspace tools and Synology kernel module
 ```
 

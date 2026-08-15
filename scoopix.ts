@@ -1,7 +1,7 @@
 #!/usr/bin/env -S deno run --allow-net --allow-read --allow-write --allow-env --allow-run
 import { ensureDir } from "https://deno.land/std@0.224.0/fs/ensure_dir.ts";
 import { exists } from "https://deno.land/std@0.224.0/fs/exists.ts";
-import { join, dirname, basename, isAbsolute, relative } from "https://deno.land/std@0.224.0/path/mod.ts";
+import { basename, dirname, isAbsolute, join, relative } from "https://deno.land/std@0.224.0/path/mod.ts";
 import { Command } from "https://deno.land/x/cliffy@v1.0.0-rc.4/command/mod.ts";
 
 function passwdHome(user: string): string | null {
@@ -57,21 +57,34 @@ function configureScoopixHome(home: string) {
   SHIMS_STATE_DIR = join(STATE_DIR, "shims");
   LOCKS_DIR = join(SCOOPIX_HOME, "locks");
 }
-const SCOOPIX_EXPORT_LINE = `export PATH="$HOME/.scoopix/bin:$PATH"\nexport MANPATH="$HOME/.scoopix/share/man:$MANPATH"`;
+const SCOOPIX_EXPORT_LINE =
+  `export PATH="$HOME/.scoopix/bin:$PATH"\nexport MANPATH="$HOME/.scoopix/share/man:$MANPATH"`;
 const DEFAULT_MAIN_BUCKET_URL = "https://github.com/raisercostin/scoopix/raw/refs/heads/main/scoopix-main.json";
 const LEGACY_MAIN_BUCKET_URLS = [
   "https://raw.githubusercontent.com/raisercostin/scoopix/main/scoopix-main.json",
 ];
 
-let VERBOSITY = 1
-let QUIET = 0
+let VERBOSITY = 1;
+let QUIET = 0;
 let firstTime = true;
-function error(msg: string) { logAt(0, "ERROR", msg); }
-function warn(msg: string) { logAt(1, "WARN", msg); }
-function status(msg: string) { logAt(1, "STATUS", msg); }
-function info(msg: string) { logAt(2, "INFO", msg); }
-function debug(msg: string) { logAt(3, "DEBUG", msg); }
-function trace(msg: string) { logAt(4, "TRACE", msg); }
+function error(msg: string) {
+  logAt(0, "ERROR", msg);
+}
+function warn(msg: string) {
+  logAt(1, "WARN", msg);
+}
+function status(msg: string) {
+  logAt(1, "STATUS", msg);
+}
+function info(msg: string) {
+  logAt(2, "INFO", msg);
+}
+function debug(msg: string) {
+  logAt(3, "DEBUG", msg);
+}
+function trace(msg: string) {
+  logAt(4, "TRACE", msg);
+}
 function log(level: number, msg: string) {
   const prefix = ["ERROR", "WARN", "INFO", "DEBUG", "TRACE", "TRACE5"][level] ?? "LOG";
   logAt(level, prefix, msg);
@@ -122,7 +135,9 @@ export type ScoopixBinary = string | string[];
 export interface ScoopixArchEntry {
   url: string;
   extract?: "zip" | "tar.gz" | "tgz";
+  extractRoot?: string;
   bin: ScoopixBinary;
+  shim?: string;
   man?: string; // optional path to a man page inside archive
 }
 export interface ScoopixDocker {
@@ -137,6 +152,8 @@ export interface ScoopixVersionSource {
   versionRegex: string;
   includePrerelease?: boolean;
 }
+
+export type ScoopixVersionSources = ScoopixVersionSource | ScoopixVersionSource[];
 
 export interface ScoopixHealthcheck {
   command?: string;
@@ -158,9 +175,10 @@ export interface ScoopixApp {
   url?: string;
   urls?: string[];
   extract?: "zip" | "tar.gz" | "tgz";
+  extractRoot?: string;
   bin?: ScoopixBinary;
   shim?: string;
-  versionSource?: ScoopixVersionSource;
+  versionSource?: ScoopixVersionSources;
   healthcheck?: ScoopixHealthcheck;
   arch?: Record<string, ScoopixArchEntry>;
   docker?: ScoopixDocker;
@@ -212,7 +230,7 @@ async function writeConfig(cfg: ScoopixConfig) {
   await chownToSudoUser(cfgPath);
 }
 
-async function listBuckets(): Promise<{ name: string, path: string }[]> {
+async function listBuckets(): Promise<{ name: string; path: string }[]> {
   info(`Listing buckets from ${SCOOPIX_HOME}`);
   const cfg = await readConfig();
   return Object.entries(cfg.buckets ?? {}).map(([name, path]) => ({ name, path }));
@@ -233,7 +251,9 @@ async function addBucket(url: string, name?: string) {
   const bucketName = name || url.split("/").pop()?.replace(/\.json$/, "") || "bucket";
   const absPath = url.startsWith("http://") || url.startsWith("https://")
     ? url
-    : isAbsolute(url) ? url : join(Deno.cwd(), url);
+    : isAbsolute(url)
+    ? url
+    : join(Deno.cwd(), url);
 
   cfg.buckets[bucketName] = absPath;
   await writeConfig(cfg);
@@ -335,7 +355,13 @@ async function printSavedVersions(app?: string) {
   for (const line of lines) console.log(line);
 }
 
-async function formatAppLine(bucket: string, app: string, meta: ScoopixApp, installed: string | null, full = true): Promise<string> {
+async function formatAppLine(
+  bucket: string,
+  app: string,
+  meta: ScoopixApp,
+  installed: string | null,
+  full = true,
+): Promise<string> {
   const appName = full ? `${bucket}/${app}` : `${bucket}/${app}`;
   const description = meta.description ?? "";
   const provides = meta.provides?.length ? ` (provides: ${meta.provides.join(", ")})` : "";
@@ -382,13 +408,15 @@ async function installedAppLines(full: boolean): Promise<string[]> {
     if (!installed) continue;
 
     const found = await findApp(app, { allowInstalledOwnerStub: true });
-    lines.push(await formatAppLine(
-      found?.bucket ?? "<unknown>",
-      app,
-      found?.info ?? { version: installed },
-      installed,
-      full,
-    ));
+    lines.push(
+      await formatAppLine(
+        found?.bucket ?? "<unknown>",
+        app,
+        found?.info ?? { version: installed },
+        installed,
+        full,
+      ),
+    );
   }
   return lines;
 }
@@ -520,7 +548,9 @@ async function findApp(
   if (matches.length === 1) return matches[0];
   if (matches.length > 1) {
     throw new Error(
-      `There are multiple '${app}' packages: ${matches.map((match) => `${match.bucket}/${match.appName}`).join(", ")}. Specify which one.`,
+      `There are multiple '${app}' packages: ${
+        matches.map((match) => `${match.bucket}/${match.appName}`).join(", ")
+      }. Specify which one.`,
     );
   }
 
@@ -558,7 +588,9 @@ function parseVersionedAppSpec(app: string): { app: string; version?: string } {
   return { app };
 }
 
-async function resolveAppMetadata(app: string): Promise<{ appName: string; version: string; info: ScoopixApp; bucket: string }> {
+async function resolveAppMetadata(
+  app: string,
+): Promise<{ appName: string; version: string; info: ScoopixApp; bucket: string }> {
   const found = await findApp(app);
   if (!found) {
     error(`app '${app}' not found`);
@@ -574,8 +606,8 @@ async function resolveAppMetadata(app: string): Promise<{ appName: string; versi
 }
 
 function compareVersionStrings(a: string, b: string): number {
-  const left = a.split(/[.-]/).map(part => Number.parseInt(part, 10));
-  const right = b.split(/[.-]/).map(part => Number.parseInt(part, 10));
+  const left = a.split(/[.-]/).map((part) => Number.parseInt(part, 10));
+  const right = b.split(/[.-]/).map((part) => Number.parseInt(part, 10));
   const len = Math.max(left.length, right.length);
   for (let i = 0; i < len; i++) {
     const av = Number.isFinite(left[i]) ? left[i] : 0;
@@ -598,14 +630,7 @@ function uniqueSortedVersions(versions: string[]): string[] {
   return [...new Set(versions.filter(Boolean))].sort((a, b) => compareVersionStrings(b, a));
 }
 
-async function discoverVersions(appId: string, infoObj: ScoopixApp): Promise<string[]> {
-  const source = infoObj.versionSource;
-  if (!source) {
-    error(`versions: '${appId}' has no versionSource in the loaded manifest`);
-    console.error("Add versionSource to the bucket manifest, or refresh/use a bucket that contains it.");
-    Deno.exit(1);
-  }
-
+async function discoverVersionsFromSource(source: ScoopixVersionSource): Promise<string[]> {
   const response = await fetch(source.url);
   if (!response.ok) throw new Error(`versionSource fetch failed: HTTP ${response.status} ${response.statusText}`);
   const text = await response.text();
@@ -614,13 +639,29 @@ async function discoverVersions(appId: string, infoObj: ScoopixApp): Promise<str
     const releases = JSON.parse(text);
     const tags = Array.isArray(releases)
       ? releases
-        .filter(release => source.includePrerelease || (!release.draft && !release.prerelease))
-        .map(release => String(release.tag_name ?? ""))
+        .filter((release) => source.includePrerelease || (!release.draft && !release.prerelease))
+        .map((release) => String(release.tag_name ?? ""))
       : [String(releases.tag_name ?? "")];
     return collectVersionsFromText(tags.filter(Boolean).join("\n"), source.versionRegex);
   }
 
   return collectVersionsFromText(text, source.versionRegex);
+}
+
+async function discoverVersions(appId: string, infoObj: ScoopixApp): Promise<string[]> {
+  const versionSource = infoObj.versionSource;
+  if (!versionSource) {
+    error(`versions: '${appId}' has no versionSource in the loaded manifest`);
+    console.error("Add versionSource to the bucket manifest, or refresh/use a bucket that contains it.");
+    Deno.exit(1);
+  }
+
+  const sources = Array.isArray(versionSource) ? versionSource : [versionSource];
+  const versions: string[] = [];
+  for (const source of sources) {
+    versions.push(...await discoverVersionsFromSource(source));
+  }
+  return uniqueSortedVersions(versions);
 }
 
 function replaceVersionInValue(value: unknown, oldVersion: string, newVersion: string): unknown {
@@ -773,7 +814,9 @@ async function forceBucketUpdate(app?: string) {
     if (!root || touched.has(root)) continue;
     touched.add(root);
     status(`Updating bucket '${name}' via git pull in ${root}`);
-    await runCommandWithLogs("git", ["-C", root, "pull", "--ff-only"], `bucket update ${name}`, root, { briefFailure: true });
+    await runCommandWithLogs("git", ["-C", root, "pull", "--ff-only"], `bucket update ${name}`, root, {
+      briefFailure: true,
+    });
   }
   if (touched.size === 0) {
     status("No git-backed local buckets to update.");
@@ -799,14 +842,24 @@ async function resolveUpgradeTarget(app: string, opts: any = {}): Promise<{
   }
 
   if (opts.fromBucket || (!requestedVersion && !infoObj.versionSource)) {
-    return { app: baseApp, appName, bucket, bucketVersion, targetVersion: bucketVersion, info: infoObj, source: "bucket" };
+    return {
+      app: baseApp,
+      appName,
+      bucket,
+      bucketVersion,
+      targetVersion: bucketVersion,
+      info: infoObj,
+      source: "bucket",
+    };
   }
 
   const appId = `${bucket}/${appName}`;
   const versions = await discoverVersions(appId, infoObj);
   const targetVersion = requestedVersion ?? versions[0] ?? bucketVersion;
   if (requestedVersion && !versions.includes(requestedVersion)) {
-    throw new Error(`${appId}: version ${requestedVersion} was not found in versionSource. Available: ${versions.join(", ")}`);
+    throw new Error(
+      `${appId}: version ${requestedVersion} was not found in versionSource. Available: ${versions.join(", ")}`,
+    );
   }
   if (targetVersion === bucketVersion) {
     return { app: baseApp, appName, bucket, bucketVersion, targetVersion, info: infoObj, source: "bucket" };
@@ -837,7 +890,13 @@ async function printVersions(app: string) {
     console.log(appId);
     console.log(`current: ${current ?? "<none>"}`);
     console.log(`installed versions: ${installed.length ? installed.join(", ") : "<none>"}`);
-    console.log(`saved: ${savedEntries.length ? savedEntries.map((entry) => `${entry.version}${entry.reason ? ` (${entry.reason})` : ""}`).join(", ") : "<none>"}`);
+    console.log(
+      `saved: ${
+        savedEntries.length
+          ? savedEntries.map((entry) => `${entry.version}${entry.reason ? ` (${entry.reason})` : ""}`).join(", ")
+          : "<none>"
+      }`,
+    );
     console.log(`bucket: ${bucketHistory.join(", ") || "<none>"}`);
     console.log(`source: ${sourceVersions.join(", ") || "<none>"}`);
   }
@@ -942,8 +1001,17 @@ async function downloadAndInstall(
   url: string,
   dest: string,
   extract?: "zip" | "tar.gz" | "tgz",
-  bin?: string,
-  opts: { keepTemp?: boolean; man?: string; appName?: string; version?: string } = {}
+  bin?: ScoopixBinary,
+  opts: {
+    keepTemp?: boolean;
+    man?: string;
+    appName?: string;
+    version?: string;
+    installRoot?: string;
+    extractRoot?: string;
+    ignoreDownloadCache?: boolean;
+    aria2?: boolean;
+  } = {},
 ) {
   const appName = opts.appName ?? basename(dest);
   const versionPart = opts.version ?? basename(dirname(dirname(dest)));
@@ -955,47 +1023,58 @@ async function downloadAndInstall(
   await ensureDir(CACHE_DIR);
   await ensureDir(TEMP_DIR);
 
-  // download if not cached
-  try {
-    await Deno.stat(cacheFile);
-    info(`downloadAndInstall: using cached file ${cacheFile}`);
-  } catch {
-    info(`downloadAndInstall: downloading ${url} -> ${cacheFile}`);
-    const resp = await fetch(url);
-    if (!resp.ok) {
-      throw new Error(`Failed to download: ${resp.status} ${resp.statusText}`);
+  if (opts.ignoreDownloadCache) {
+    await downloadFile(url, cacheFile, { force: true, label: `${appName} ${versionPart}`, aria2: opts.aria2 });
+  } else {
+    try {
+      await Deno.stat(cacheFile);
+      status(`[cache] using ${cacheFile}`);
+    } catch {
+      await downloadFile(url, cacheFile, { label: `${appName} ${versionPart}`, aria2: opts.aria2 });
     }
-    const file = await Deno.open(cacheFile, {
-      write: true,
-      create: true,
-      truncate: true,
-    });
-    await resp.body?.pipeTo(file.writable);
   }
 
   if (extract) {
-    info(`downloadAndInstall: extracting ${extract} archive into ${tempDir}`);
-    await Deno.remove(tempDir, { recursive: true }).catch(() => { });
+    status(`[extract] ${extract} ${cacheFile} -> ${tempDir}`);
+    await Deno.remove(tempDir, { recursive: true }).catch(() => {});
     await ensureDir(tempDir);
 
     if (extract === "tar.gz" || extract === "tgz") {
       const cmd = new Deno.Command("tar", {
         args: ["-xzf", normalizeToolPath(cacheFile), "-C", normalizeToolPath(tempDir)],
       });
-      const { code } = await cmd.output();
-      if (code !== 0) throw new Error(`tar extraction failed for ${url}`);
+      const { code, stderr } = await cmd.output();
+      if (code !== 0) {
+        throw new Error(`tar extraction failed for ${url}: ${new TextDecoder().decode(stderr).trim()}`);
+      }
     } else if (extract === "zip") {
       const cmd = new Deno.Command("unzip", {
         args: ["-o", normalizeToolPath(cacheFile), "-d", normalizeToolPath(tempDir)],
       });
-      const { code } = await cmd.output();
-      if (code !== 0) throw new Error(`unzip extraction failed for ${url}`);
+      const { code, stderr } = await cmd.output();
+      if (code !== 0) {
+        throw new Error(`unzip extraction failed for ${url}: ${new TextDecoder().decode(stderr).trim()}`);
+      }
+    }
+    status(`[extract] completed ${tempDir}`);
+
+    if (opts.extractRoot) {
+      status(`[install] copying ${opts.extractRoot} -> ${opts.installRoot ?? dirname(dest)}`);
+      await copyTree(join(tempDir, opts.extractRoot), opts.installRoot ?? dirname(dest));
     }
 
     if (!bin) throw new Error(`Archive from ${url} requires a 'bin' field`);
-    const src = join(tempDir, bin);
-    await ensureDir(dirname(dest));
-    await Deno.copyFile(src, dest);
+    const bins = Array.isArray(bin) ? bin : [bin];
+    status(`[install] installing ${bins.length} binary entr${bins.length === 1 ? "y" : "ies"}`);
+    for (const [index, binEntry] of bins.entries()) {
+      const src = opts.extractRoot ? join(opts.installRoot ?? dirname(dest), binEntry) : join(tempDir, binEntry);
+      const target = index === 0 ? dest : join(opts.installRoot ?? dirname(dest), binEntry);
+      if (src !== target) {
+        await ensureDir(dirname(target));
+        info(`downloadAndInstall: copying ${src} -> ${target}`);
+        await Deno.copyFile(src, target);
+      }
+    }
 
     if (opts.man) {
       const manTargetDir = join(SCOOPIX_HOME, "share", "man", "man1");
@@ -1006,21 +1085,31 @@ async function downloadAndInstall(
     }
 
     if (!opts.keepTemp) {
-      await Deno.remove(tempDir, { recursive: true }).catch(() => { });
+      await Deno.remove(tempDir, { recursive: true }).catch(() => {});
       info(`downloadAndInstall: cleaned temp dir ${tempDir}`);
     } else {
       warn(`downloadAndInstall: kept temp dir for debugging: ${tempDir}`);
     }
   } else {
-    info(`downloadAndInstall: copying cached binary ${cacheFile} -> ${dest}`);
+    status(`[install] copying ${cacheFile} -> ${dest}`);
     await ensureDir(dirname(dest));
     await Deno.copyFile(cacheFile, dest);
   }
 
-  await Deno.chmod(dest, 0o755);
-  info(`downloadAndInstall: saved to ${dest}`);
+  for (
+    const target of extract && bin
+      ? appBinNames(bin, appName).map((entry, index) =>
+        index === 0 ? dest : join(opts.installRoot ?? dirname(dest), entry)
+      )
+      : [dest]
+  ) {
+    await Deno.chmod(target, 0o755).catch(() => {});
+  }
+  status(`[install] saved ${dest}`);
 }
-async function resolveAppInfo(app: string): Promise<{ appName: string; version: string; info: ScoopixApp; bucket: string }> {
+async function resolveAppInfo(
+  app: string,
+): Promise<{ appName: string; version: string; info: ScoopixApp; bucket: string }> {
   const found = await findApp(app);
   if (!found) {
     error(`installApp: app '${app}' not found`);
@@ -1035,7 +1124,7 @@ async function resolveAppInfo(app: string): Promise<{ appName: string; version: 
   const archLabel = archKeys.join(", ");
 
   info(`installApp: detected host keys '${archLabel}'`);
-  const archObj = archKeys.map(key => appInfo.arch?.[key]).find(Boolean);
+  const archObj = archKeys.map((key) => appInfo.arch?.[key]).find(Boolean);
   if (appInfo.arch && !archObj) {
     error(`installApp: '${appName}' is not available for this host (host keys=${archLabel})`);
     console.error(`Available arch keys: ${Object.keys(appInfo.arch).join(", ")}`);
@@ -1076,8 +1165,25 @@ async function installFromBinary(infoObj: ScoopixApp, dest: string, opts: any) {
     dest,
     infoObj.extract,
     infoObj.bin,
-    { keepTemp: opts.keepTemp, man: infoObj.man, appName: opts.appName, version: opts.version }
+    {
+      keepTemp: opts.keepTemp,
+      man: infoObj.man,
+      appName: opts.appName,
+      version: opts.version,
+      installRoot: opts.installRoot,
+      extractRoot: infoObj.extractRoot,
+      ignoreDownloadCache: opts.ignoreDownloadCache,
+      aria2: opts.aria2,
+    },
   );
+}
+
+function appBinNames(bin: ScoopixBinary | undefined, appName: string): string[] {
+  return Array.isArray(bin) ? bin : [bin ?? appName];
+}
+
+function shimNameFromBin(binName: string): string {
+  return basename(binName).replace(/\.exe$/i, "");
 }
 
 async function installFromDelegated(infoObj: ScoopixApp, appName: string) {
@@ -1112,15 +1218,25 @@ async function runHealthcheck(
   const text = stream === "stderr" ? stderr : stream === "combined" ? `${stdout}\n${stderr}`.trim() : stdout;
 
   if (!result.success) {
-    throw new Error(`healthcheck failed for ${packageId}:${version}; exit code ${result.code}; output: ${formatStream(text)}`);
+    throw new Error(
+      `healthcheck failed for ${packageId}:${version}; exit code ${result.code}; output: ${formatStream(text)}`,
+    );
   }
   if (healthcheck.match && !new RegExp(expandPlaceholders(healthcheck.match, placeholders)).test(text)) {
-    throw new Error(`healthcheck failed for ${packageId}:${version}; expected ${healthcheck.match}; output: ${formatStream(text)}`);
+    throw new Error(
+      `healthcheck failed for ${packageId}:${version}; expected ${healthcheck.match}; output: ${formatStream(text)}`,
+    );
   }
   console.log(`Healthcheck passed: ${packageId}:${version}${text ? ` - ${text.split(/\r?\n/)[0]}` : ""}`);
 }
 
-async function linkAppBinaries(packageId: string, appName: string, version: string, binName: string, shimName = appName) {
+async function linkAppBinaries(
+  packageId: string,
+  appName: string,
+  version: string,
+  binName: string,
+  shimName = appName,
+) {
   const currentLink = join(APPS_DIR, appName, "current");
   const versionDir = join(APPS_DIR, appName, version);
   await ensureDir(BIN_DIR);
@@ -1128,9 +1244,13 @@ async function linkAppBinaries(packageId: string, appName: string, version: stri
   const shimTarget = join(currentLink, "bin", binName);
   await assertShimAvailable(shimName, binPath, packageId, version, appName, join(versionDir, "bin", binName));
 
-  try { await Deno.remove(currentLink, { recursive: true }); } catch { }
+  try {
+    await Deno.remove(currentLink, { recursive: true });
+  } catch {}
   await Deno.symlink(versionDir, currentLink, { type: "dir" });
-  try { await Deno.remove(binPath); } catch { }
+  try {
+    await Deno.remove(binPath);
+  } catch {}
   await Deno.symlink(shimTarget, binPath, { type: "file" });
   await writeAppState(appName, packageId, version);
   await writeShimState(shimName, packageId, version, shimTarget);
@@ -1174,12 +1294,28 @@ async function postInstallVerify(
 async function installApp(app: string, opts: any = {}) {
   info(`installApp called with app='${app}'`);
   const installOpts = { ...opts, requestedApp: opts.requestedApp ?? app };
+  const parsed = parseVersionedAppSpec(app);
+  const requestedVersion = installOpts.version ?? parsed.version;
 
-  const resolved = await resolveAppInfo(app);
+  const resolved = await resolveAppInfo(parsed.app);
   const appName = resolved.appName;
-  const version = installOpts.resolvedVersion ?? resolved.version;
-  const infoObj = installOpts.resolvedInfo ?? resolved.info;
   const bucket = resolved.bucket;
+  let version = installOpts.resolvedVersion ?? resolved.version;
+  let infoObj = installOpts.resolvedInfo ?? resolved.info;
+
+  if (requestedVersion && !installOpts.resolvedVersion && !installOpts.resolvedInfo) {
+    const appId = `${bucket}/${appName}`;
+    const versions = await discoverVersions(appId, resolved.info);
+    if (!versions.includes(requestedVersion)) {
+      throw new Error(
+        `${appId}: version ${requestedVersion} was not found in versionSource. Available: ${versions.join(", ")}`,
+      );
+    }
+    infoObj = replaceVersionInValue(resolved.info, resolved.version, requestedVersion) as ScoopixApp;
+    infoObj.version = requestedVersion;
+    version = requestedVersion;
+  }
+
   const stack = installOpts.stack ?? [];
   if (stack.includes(appName)) {
     throw new Error(`Dependency cycle detected: ${[...stack, appName].join(" -> ")}`);
@@ -1205,14 +1341,21 @@ async function installApp(app: string, opts: any = {}) {
     return;
   }
 
-  const binName = infoObj.bin?.toString() ?? appName;
-  const shimName = infoObj.shim ?? appName;
+  const binNames = appBinNames(infoObj.bin, appName);
+  const binName = binNames[0];
+  const shimName = infoObj.shim ?? shimNameFromBin(binName);
   const packageId = `${bucket}/${appName}`;
   await assertAppAvailable(appName, packageId, version);
-  const { dest } = await prepareAppDirectories(appName, version, binName);
+  const { appDir, dest } = await prepareAppDirectories(appName, version, binName);
   const canUseInstalled = !installOpts.ignoreBuildCache && !installOpts.ignoreDownloadCache;
+  const allDestinationsExist = async () => {
+    for (const candidate of binNames) {
+      if (!(await exists(join(appDir, candidate)))) return false;
+    }
+    return true;
+  };
 
-  if (canUseInstalled && await exists(dest)) {
+  if (canUseInstalled && await allDestinationsExist()) {
     if (await isAppLinked(appName, version, binName, shimName)) {
       const shimTarget = join(APPS_DIR, appName, "current", "bin", binName);
       await assertShimAvailable(shimName, join(BIN_DIR, shimName), packageId, version, appName, shimTarget);
@@ -1224,7 +1367,15 @@ async function installApp(app: string, opts: any = {}) {
       }
       return;
     }
-    await linkAppBinaries(packageId, appName, version, binName, shimName);
+    for (const [index, candidate] of binNames.entries()) {
+      await linkAppBinaries(
+        packageId,
+        appName,
+        version,
+        candidate,
+        index === 0 ? shimName : shimNameFromBin(candidate),
+      );
+    }
     if (!installOpts.suppressOutput) {
       console.log(`Relinked existing: ${packageId}:${version}.`);
       await postInstallVerify(packageId, appName, version, infoObj, binName, shimName);
@@ -1238,10 +1389,12 @@ async function installApp(app: string, opts: any = {}) {
     info(`installApp: source build requested for '${appName}'`);
     await buildFromSource(appName, infoObj as any, dest, opts);
   } else {
-    await installFromBinary(infoObj, dest, { ...opts, appName, version });
+    await installFromBinary(infoObj, dest, { ...opts, appName, version, installRoot: appDir });
   }
 
-  await linkAppBinaries(packageId, appName, version, binName, shimName);
+  for (const [index, candidate] of binNames.entries()) {
+    await linkAppBinaries(packageId, appName, version, candidate, index === 0 ? shimName : shimNameFromBin(candidate));
+  }
   if (!installOpts.suppressOutput) {
     await postInstallVerify(packageId, appName, version, infoObj, binName, shimName);
   }
@@ -1324,12 +1477,19 @@ async function readAppState(appName: string): Promise<AppState | null> {
 
 async function writeAppState(appName: string, owner: string, version: string) {
   await ensureDir(APPS_STATE_DIR);
-  await Deno.writeTextFile(appStatePath(appName), JSON.stringify({
-    name: appName,
-    owner,
-    version,
-    updatedAt: new Date().toISOString(),
-  }, null, 2));
+  await Deno.writeTextFile(
+    appStatePath(appName),
+    JSON.stringify(
+      {
+        name: appName,
+        owner,
+        version,
+        updatedAt: new Date().toISOString(),
+      },
+      null,
+      2,
+    ),
+  );
 }
 
 async function removeAppState(appName: string) {
@@ -1360,13 +1520,20 @@ async function readShimState(shimName: string): Promise<ShimState | null> {
 
 async function writeShimState(shimName: string, owner: string, version: string, target: string) {
   await ensureDir(SHIMS_STATE_DIR);
-  await Deno.writeTextFile(shimStatePath(shimName), JSON.stringify({
-    name: shimName,
-    owner,
-    version,
-    target,
-    updatedAt: new Date().toISOString(),
-  }, null, 2));
+  await Deno.writeTextFile(
+    shimStatePath(shimName),
+    JSON.stringify(
+      {
+        name: shimName,
+        owner,
+        version,
+        target,
+        updatedAt: new Date().toISOString(),
+      },
+      null,
+      2,
+    ),
+  );
 }
 
 async function removeShimState(shimName: string) {
@@ -1440,12 +1607,14 @@ async function uninstallApp(app: string, opts: { all?: boolean } = {}) {
     );
   }
 
-  const candidates = [...new Set([
-    join(BIN_DIR, shimName),
-    join(BIN_DIR, appName),
-    join(DEFAULT_BIN_DIR, shimName),
-    join(DEFAULT_BIN_DIR, appName),
-  ])];
+  const candidates = [
+    ...new Set([
+      join(BIN_DIR, shimName),
+      join(BIN_DIR, appName),
+      join(DEFAULT_BIN_DIR, shimName),
+      join(DEFAULT_BIN_DIR, appName),
+    ]),
+  ];
   const removed: string[] = [];
 
   const removeActiveLinks = opts.all || !parsed.version || parsed.version === current;
@@ -1538,7 +1707,7 @@ async function buildFromSource(
     info(`[build] reusing existing docker image ${imageTag}`);
   } else {
     const runSteps = infoObj.docker.commands
-      .map(c => expandPlaceholders(c, { ...infoObj, ...(infoObj.vars ?? {}), app, version }))
+      .map((c) => expandPlaceholders(c, { ...infoObj, ...(infoObj.vars ?? {}), app, version }))
       .join(" && ");
 
     const dockerfile = [
@@ -1620,6 +1789,56 @@ function formatCommand(cmd: string, args: string[]): string {
 
 function displayPath(path: string): string {
   return path.replaceAll("\\", "/");
+}
+
+async function availableBytesForPath(path: string): Promise<number | null> {
+  if (Deno.build.os === "windows") {
+    const drive = path.match(/^([A-Za-z]:)/)?.[1];
+    if (!drive) return null;
+    const result = await new Deno.Command("cmd", {
+      args: ["/c", "fsutil", "volume", "diskfree", drive],
+      stdout: "piped",
+      stderr: "null",
+    }).output().catch(() => null);
+    if (!result || result.code !== 0) return null;
+    const text = new TextDecoder().decode(result.stdout);
+    const match = text.match(/(?:Total # of free bytes|Total free bytes)\s*:\s*([0-9,]+)/i);
+    return match ? Number(match[1].replaceAll(",", "")) : null;
+  }
+
+  const result = await new Deno.Command("df", {
+    args: ["-Pk", dirname(path)],
+    stdout: "piped",
+    stderr: "null",
+  }).output().catch(() => null);
+  if (!result || result.code !== 0) return null;
+  const lines = new TextDecoder().decode(result.stdout).trim().split(/\r?\n/);
+  const fields = lines.at(-1)?.trim().split(/\s+/);
+  const availableKb = fields?.[3] ? Number(fields[3]) : NaN;
+  return Number.isFinite(availableKb) ? availableKb * 1024 : null;
+}
+
+async function remoteContentLength(url: string): Promise<number | null> {
+  const response = await fetch(url, { method: "HEAD" }).catch(() => null);
+  if (!response?.ok) return null;
+  const length = Number(response.headers.get("content-length") ?? "0");
+  return Number.isFinite(length) && length > 0 ? length : null;
+}
+
+async function assertEnoughSpace(dest: string, requiredBytes: number | null) {
+  if (!requiredBytes) return;
+  const available = await availableBytesForPath(dest);
+  if (available === null) return;
+  const reserve = Math.max(50 * 1024 * 1024, Math.ceil(requiredBytes * 0.05));
+  if (available < requiredBytes + reserve) {
+    throw new Error(
+      `not enough disk space for download: need at least ${
+        requiredBytes + reserve
+      } bytes (${requiredBytes} bytes file + ${reserve} bytes reserve), available ${available} bytes at ${
+        dirname(dest)
+      }`,
+    );
+  }
 }
 
 function normalizePathForCompare(path: string): string {
@@ -1736,7 +1955,6 @@ async function runCommandWithLogs(
   debug(`# ${context} completed; exit code 0; duration ${durationMs} ms`);
 }
 
-
 function placeholderValue(obj: Record<string, any>, path: string): unknown {
   return path.split(".").reduce((value, key) => {
     if (value && typeof value === "object" && key in value) {
@@ -1753,7 +1971,11 @@ function expandPlaceholders(cmd: string, obj: Record<string, any>): string {
   });
 }
 
-async function downloadFile(url: string, dest: string, opts: { force?: boolean; label?: string } = {}) {
+async function downloadFile(
+  url: string,
+  dest: string,
+  opts: { force?: boolean; label?: string; aria2?: boolean } = {},
+) {
   if (!opts.force && await exists(dest)) {
     status(`[download] using cached file ${dest}`);
     return;
@@ -1764,6 +1986,52 @@ async function downloadFile(url: string, dest: string, opts: { force?: boolean; 
   await Deno.remove(tempDest, { recursive: true }).catch(() => {});
 
   status(`[download] ${url} -> ${dest}`);
+  const expectedBytes = await remoteContentLength(url);
+  await assertEnoughSpace(dest, expectedBytes);
+
+  const aria2c = opts.aria2 && (url.startsWith("http://") || url.startsWith("https://"))
+    ? await commandPath("aria2c")
+    : null;
+  if (aria2c) {
+    const result = await new Deno.Command(aria2c, {
+      args: [
+        "--allow-overwrite=true",
+        "--auto-file-renaming=false",
+        "--continue=true",
+        "--dir",
+        dirname(dest),
+        "--file-allocation=none",
+        "--max-connection-per-server=8",
+        "--min-split-size=1M",
+        "--out",
+        basename(tempDest),
+        "--split=8",
+        url,
+      ],
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    if (result.code !== 0) {
+      const stdout = new TextDecoder().decode(result.stdout).trim();
+      const stderr = new TextDecoder().decode(result.stderr).trim();
+      throw new Error(
+        `aria2c download failed for ${url}\n${formatStream([stdout, stderr].filter(Boolean).join("\n"))}`,
+      );
+    }
+    const stat = await Deno.stat(tempDest).catch(() => null);
+    if (!stat?.isFile || stat.size === 0) {
+      throw new Error(`aria2c did not create a valid download file: ${tempDest}`);
+    }
+    if (expectedBytes && stat.size !== expectedBytes) {
+      throw new Error(`aria2c download size mismatch for ${url}: file has ${stat.size}/${expectedBytes} bytes`);
+    }
+    await Deno.remove(dest).catch(() => {});
+    await Deno.rename(tempDest, dest);
+    await Deno.remove(`${tempDest}.aria2`).catch(() => {});
+    status(`[download] completed ${dest} (${stat.size} bytes)`);
+    return;
+  }
+
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`Failed to download ${url}: ${resp.status} ${resp.statusText}`);
 
@@ -1799,8 +2067,18 @@ async function downloadFile(url: string, dest: string, opts: { force?: boolean; 
   }
 
   await Deno.remove(dest).catch(() => {});
+  if (total > 0 && downloaded !== total) {
+    throw new Error(`download incomplete for ${url}: got ${downloaded}/${total} bytes`);
+  }
+  const stat = await Deno.stat(tempDest).catch(() => null);
+  if (!stat?.isFile || stat.size === 0) {
+    throw new Error(`download did not create a valid file: ${tempDest}`);
+  }
+  if (total > 0 && stat.size !== total) {
+    throw new Error(`download size mismatch for ${url}: file has ${stat.size}/${total} bytes`);
+  }
   await Deno.rename(tempDest, dest);
-  status(`[download] completed ${dest}`);
+  status(`[download] completed ${dest} (${stat.size} bytes)`);
 }
 
 async function copyTree(src: string, dest: string) {
@@ -1851,15 +2129,26 @@ async function isRootUser(): Promise<boolean> {
   return id.code === 0 && id.stdout.trim() === "0";
 }
 
-async function writeInstallState(app: string, statusValue: "installed" | "failed", detail: Record<string, unknown> = {}) {
+async function writeInstallState(
+  app: string,
+  statusValue: "installed" | "failed",
+  detail: Record<string, unknown> = {},
+) {
   await ensureDir(STATE_DIR);
   const statePath = join(STATE_DIR, `${safeStateName(app)}.json`);
-  await Deno.writeTextFile(statePath, JSON.stringify({
-    app,
-    status: statusValue,
-    updatedAt: new Date().toISOString(),
-    ...detail,
-  }, null, 2));
+  await Deno.writeTextFile(
+    statePath,
+    JSON.stringify(
+      {
+        app,
+        status: statusValue,
+        updatedAt: new Date().toISOString(),
+        ...detail,
+      },
+      null,
+      2,
+    ),
+  );
 }
 
 async function readInstallState(app: string): Promise<any | null> {
@@ -1870,28 +2159,63 @@ async function readInstallState(app: string): Promise<any | null> {
   }
 }
 
+async function isProcessAlive(pid: number): Promise<boolean> {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (pid === Deno.pid) return true;
+  if (Deno.build.os === "windows") {
+    const result = await new Deno.Command("cmd", {
+      args: ["/c", "tasklist", "/FI", `PID eq ${pid}`, "/NH"],
+      stdout: "piped",
+      stderr: "null",
+    }).output();
+    return result.code === 0 && new TextDecoder().decode(result.stdout).includes(String(pid));
+  }
+  const result = await new Deno.Command("kill", {
+    args: ["-0", String(pid)],
+    stdout: "null",
+    stderr: "null",
+  }).output();
+  return result.code === 0;
+}
+
 async function withInstallLock<T>(app: string, fn: () => Promise<T>): Promise<T> {
   await ensureDir(LOCKS_DIR);
   const lockDir = join(LOCKS_DIR, `${safeStateName(app)}.lock`);
   try {
     await Deno.mkdir(lockDir);
-    await Deno.writeTextFile(join(lockDir, "owner.json"), JSON.stringify({
-      app,
-      pid: Deno.pid,
-      startedAt: new Date().toISOString(),
-    }, null, 2));
+    await Deno.writeTextFile(
+      join(lockDir, "owner.json"),
+      JSON.stringify(
+        {
+          app,
+          pid: Deno.pid,
+          startedAt: new Date().toISOString(),
+        },
+        null,
+        2,
+      ),
+    );
   } catch (err) {
     if (!(err instanceof Deno.errors.AlreadyExists)) {
-      throw new Error(`could not create install lock '${lockDir}': ${err instanceof Error ? err.message : String(err)}`);
+      throw new Error(
+        `could not create install lock '${lockDir}': ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
     const ownerPath = join(lockDir, "owner.json");
-    let detail = lockDir;
+    let ownerText = "<missing owner.json>";
     try {
-      detail = await Deno.readTextFile(ownerPath);
+      ownerText = await Deno.readTextFile(ownerPath);
+      const owner = JSON.parse(ownerText);
+      if (typeof owner.pid === "number" && !(await isProcessAlive(owner.pid))) {
+        await Deno.remove(lockDir, { recursive: true }).catch(() => {});
+        return await withInstallLock(app, fn);
+      }
     } catch {
-      // Keep the lock path as the diagnostic.
+      // Keep the lock path as the main diagnostic.
     }
-    throw new Error(`another install is already running or a previous install left a lock: ${detail}`);
+    throw new Error(
+      `another install is already running or a previous install left a lock\nLock: ${lockDir}\nOwner: ${ownerText}`,
+    );
   }
 
   try {
@@ -1959,7 +2283,9 @@ async function runPackageScript(app: string, scriptName: string) {
   };
 
   console.log(`Running: ${bucket}/${appName}:${version} ${scriptName}`);
-  await runManifestCommands(commandList(script), placeholders, `script ${bucket}/${appName}:${scriptName}`, workDir, { briefFailure: true });
+  await runManifestCommands(commandList(script), placeholders, `script ${bucket}/${appName}:${scriptName}`, workDir, {
+    briefFailure: true,
+  });
   console.log(`Script complete: ${bucket}/${appName}:${version} ${scriptName}`);
 }
 
@@ -2032,7 +2358,9 @@ async function installArtifact(appName: string, version: string, infoObj: any, o
       }
     } else {
       if (!opts.suppressOutput) {
-        console.log("Install manually or with a future --system command. For Synology SPKs, use DSM Package Center or synopkg.");
+        console.log(
+          "Install manually or with a future --system command. For Synology SPKs, use DSM Package Center or synopkg.",
+        );
       }
     }
   };
@@ -2050,8 +2378,12 @@ async function installArtifact(appName: string, version: string, infoObj: any, o
   }
 
   if (opts.system && await isRootUser()) {
-    warn("installArtifact: building as root because --system was requested; cache/temp/artifact files under HOME may become root-owned.");
-    warn("installArtifact: to avoid that, build once without --system as the normal user, then rerun --system to reuse the cached artifact.");
+    warn(
+      "installArtifact: building as root because --system was requested; cache/temp/artifact files under HOME may become root-owned.",
+    );
+    warn(
+      "installArtifact: to avoid that, build once without --system as the normal user, then rerun --system to reuse the cached artifact.",
+    );
   }
 
   status(`installArtifact: building artifact '${appName}' ${version}`);
@@ -2059,13 +2391,16 @@ async function installArtifact(appName: string, version: string, infoObj: any, o
   await ensureDir(workDir);
   await ensureDir(artifactCacheDir);
 
-  const urls = [infoObj.url, ...(infoObj.urls ?? [])].filter((url): url is string => typeof url === "string" && url.length > 0);
+  const urls = [infoObj.url, ...(infoObj.urls ?? [])].filter((url): url is string =>
+    typeof url === "string" && url.length > 0
+  );
   for (const entry of urls) {
     const url = expandPlaceholders(entry, placeholders);
     const dest = join(artifactCacheDir, basename(new URL(url).pathname));
     await downloadFile(url, dest, {
       force: opts.ignoreDownloadCache,
       label: `${appName}/${basename(dest)}`,
+      aria2: opts.aria2,
     });
   }
 
@@ -2126,8 +2461,8 @@ async function detectShellInits(): Promise<ShellInitSuggestion[]> {
       }
     }
     if (existing.length > 0) {
-      const recommended = existing.find(f => f.includes("rc")) ?? existing[0];
-      const alternates = existing.filter(f => f !== recommended);
+      const recommended = existing.find((f) => f.includes("rc")) ?? existing[0];
+      const alternates = existing.filter((f) => f !== recommended);
       results.push({ shell, recommended, alternates });
     }
   }
@@ -2139,7 +2474,7 @@ async function detectShellInits(): Promise<ShellInitSuggestion[]> {
   return results;
 }
 function formatShellInits(suggestions: ShellInitSuggestion[]): string[] {
-  return suggestions.map(s => {
+  return suggestions.map((s) => {
     const note = s.alternates.length > 0
       ? `recommended (${s.recommended}), other candidates: ${s.alternates.join(", ")}`
       : `recommended (${s.recommended})`;
@@ -2217,7 +2552,7 @@ async function initShell(
 
   const home = USER_HOME;
   const suggestions = await detectShellInits();
-  const found = suggestions.find(s => s.shell === shell);
+  const found = suggestions.find((s) => s.shell === shell);
 
   if (!found) {
     if (opts.auto && suggestions.length > 0) {
@@ -2230,7 +2565,7 @@ async function initShell(
     }
   }
 
-  const selected = suggestions.find(s => s.shell === shell)!;
+  const selected = suggestions.find((s) => s.shell === shell)!;
   const rcFile = join(home, selected.recommended);
 
   await ensureDir(dirname(rcFile));
@@ -2274,13 +2609,13 @@ async function removeShellPath(
   }
 
   const suggestions = await detectShellInits();
-  const found = suggestions.find(s => s.shell === shell);
+  const found = suggestions.find((s) => s.shell === shell);
   if (!found) {
     if (opts.auto && suggestions.length > 0) shell = suggestions[0].shell;
     else throw new Error(`Unsupported or undetected shell: ${shell}`);
   }
 
-  const selected = suggestions.find(s => s.shell === shell)!;
+  const selected = suggestions.find((s) => s.shell === shell)!;
   const rcFile = join(USER_HOME, selected.recommended);
   let contents: string;
   try {
@@ -2321,7 +2656,9 @@ async function writeWindowsUserPath(value: string) {
   info(`reg add HKCU\\Environment Path: ${result.stdout || result.stderr}`);
 }
 
-async function configureWindowsUserPath(opts: { quietAlready?: boolean; quietChanged?: boolean } = {}): Promise<boolean> {
+async function configureWindowsUserPath(
+  opts: { quietAlready?: boolean; quietChanged?: boolean } = {},
+): Promise<boolean> {
   if (Deno.build.os !== "windows") return false;
   const current = await windowsUserPath();
   if (current.endsWith("\\") || /[A-Za-z]:\\[A-Za-z]{1,2}$/.test(current)) {
@@ -2524,7 +2861,9 @@ async function doctorHost() {
       name: "vars.dsmVer",
       status: installerDsmVer ? "ok" : "warn",
       detail: installerDsmVer
-        ? `${installerDsmVer}${installedDsmVersion && installedDsmVersion !== installerDsmVer ? ` (from DSM ${installedDsmVersion})` : ""}`
+        ? `${installerDsmVer}${
+          installedDsmVersion && installedDsmVersion !== installerDsmVer ? ` (from DSM ${installedDsmVersion})` : ""
+        }`
         : "not detected",
     });
   }
@@ -2540,7 +2879,11 @@ async function doctorHost() {
     ].filter(Boolean).join(" ");
     printDoctorCheck({ name: "DSM version", status: "ok", detail: label });
   } else {
-    printDoctorCheck({ name: "DSM version", status: "info", detail: "not Synology DSM or /etc.defaults/VERSION is unreadable" });
+    printDoctorCheck({
+      name: "DSM version",
+      status: "info",
+      detail: "not Synology DSM or /etc.defaults/VERSION is unreadable",
+    });
   }
 
   const uname = await captureCommand("uname", ["-a"]);
@@ -2577,10 +2920,16 @@ async function doctorHost() {
     printDoctorCheck({
       name: "Docker",
       status: docker.code === 0 ? "ok" : "warn",
-      detail: docker.code === 0 ? dockerPath : `${dockerPath} exists but daemon check failed: ${docker.stderr || docker.stdout}`,
+      detail: docker.code === 0
+        ? dockerPath
+        : `${dockerPath} exists but daemon check failed: ${docker.stderr || docker.stdout}`,
     });
   } else {
-    printDoctorCheck({ name: "Docker", status: "warn", detail: "docker not found on PATH; SPK artifact builds require Docker or Container Manager" });
+    printDoctorCheck({
+      name: "Docker",
+      status: "warn",
+      detail: "docker not found on PATH; SPK artifact builds require Docker or Container Manager",
+    });
   }
 
   const gitPath = await commandPath("git") ?? await firstExisting([
@@ -2618,7 +2967,27 @@ function assertNotIncludes(haystack: string, needle: string, message: string) {
   }
 }
 
-async function runAutotest() {
+const AUTOTESTS = [
+  "locks",
+  "install-force",
+  "install-version",
+  "version-sources",
+];
+
+function printAutotests() {
+  console.log("Available autotests:");
+  console.log("  all");
+  for (const test of AUTOTESTS) console.log(`  ${test}`);
+}
+
+async function runAutotest(test = "all") {
+  if (test === "list") {
+    printAutotests();
+    return;
+  }
+  if (test !== "all" && !AUTOTESTS.includes(test)) {
+    throw new Error(`Unknown autotest '${test}'. Run 'scoopix autotest list' to see available tests.`);
+  }
   status("Starting autotest");
   const root = join(Deno.cwd(), `.scoopix-autotest-${Date.now()}-${Deno.pid}`);
   const home = join(root, "home");
@@ -2632,46 +3001,71 @@ async function runAutotest() {
     const betaBucket = join(root, "beta.json");
 
     await Deno.writeTextFile(emptyBucket, "{}");
-    await Deno.writeTextFile(alphaBucket, JSON.stringify({
-      same: {
-        version: "1.0",
-        url: "data:text/plain,alpha-1.0",
-        bin: "same",
-        description: "alpha source",
-        versionSource: {
-          url: "data:text/plain,2.0%0A1.0",
-          versionRegex: "^(\\d+\\.\\d+)$",
+    await Deno.writeTextFile(
+      alphaBucket,
+      JSON.stringify({
+        same: {
+          version: "1.0",
+          url: "data:text/plain,alpha-1.0",
+          bin: "same",
+          description: "alpha source",
+          versionSource: {
+            url: "data:text/plain,2.0%0A1.0",
+            versionRegex: "^(\\d+\\.\\d+)$",
+          },
         },
-      },
-      multi: {
-        version: "1.0",
-        url: "data:text/plain,alpha-multi",
-        bin: "multi",
-        description: "alpha duplicate-name candidate",
-      },
-    }));
-    await Deno.writeTextFile(duplicateBucket, JSON.stringify({
-      same: {
-        version: "1.0",
-        url: "data:text/plain,alpha",
-        bin: "same",
-        description: "duplicate source",
-      },
-      multi: {
-        version: "1.0",
-        url: "data:text/plain,duplicate-multi",
-        bin: "multi",
-        description: "duplicate duplicate-name candidate",
-      },
-    }));
-    await Deno.writeTextFile(betaBucket, JSON.stringify({
-      same: {
-        version: "2.0",
-        url: "data:text/plain,beta",
-        bin: "same",
-        description: "beta source",
-      },
-    }));
+        spaced: {
+          version: "1.0",
+          url: "data:text/plain,spaced-1.0",
+          bin: "spaced",
+          description: "multi-space version source candidate",
+          versionSource: [
+            {
+              url: "data:text/plain,1.0%0A1.1",
+              versionRegex: "^(\\d+\\.\\d+)$",
+            },
+            {
+              url: "data:text/plain,2.0%0A2.1",
+              versionRegex: "^(\\d+\\.\\d+)$",
+            },
+          ],
+        },
+        multi: {
+          version: "1.0",
+          url: "data:text/plain,alpha-multi",
+          bin: "multi",
+          description: "alpha duplicate-name candidate",
+        },
+      }),
+    );
+    await Deno.writeTextFile(
+      duplicateBucket,
+      JSON.stringify({
+        same: {
+          version: "1.0",
+          url: "data:text/plain,alpha",
+          bin: "same",
+          description: "duplicate source",
+        },
+        multi: {
+          version: "1.0",
+          url: "data:text/plain,duplicate-multi",
+          bin: "multi",
+          description: "duplicate duplicate-name candidate",
+        },
+      }),
+    );
+    await Deno.writeTextFile(
+      betaBucket,
+      JSON.stringify({
+        same: {
+          version: "2.0",
+          url: "data:text/plain,beta",
+          bin: "same",
+          description: "beta source",
+        },
+      }),
+    );
 
     status("autotest: configure isolated local buckets");
     await addBucket(emptyBucket, "main");
@@ -2679,8 +3073,105 @@ async function runAutotest() {
     await addBucket(duplicateBucket, "duplicate");
     await addBucket(betaBucket, "beta");
 
-    status("autotest: install first provider");
-    await installApp("alpha/same");
+    const testLocks = async () => {
+      status("autotest: stale install locks are cleaned up and active locks show paths");
+      const staleLockApp = "alpha/stale-lock";
+      const staleLockDir = join(LOCKS_DIR, `${safeStateName(staleLockApp)}.lock`);
+      await ensureDir(staleLockDir);
+      await Deno.writeTextFile(
+        join(staleLockDir, "owner.json"),
+        JSON.stringify({ app: staleLockApp, pid: 999999999, startedAt: new Date().toISOString() }, null, 2),
+      );
+      let staleLockRan = false;
+      await withInstallLock(staleLockApp, async () => {
+        staleLockRan = true;
+      });
+      if (!staleLockRan) throw new Error("stale install lock should be removed and retried");
+
+      const activeLockApp = "alpha/active-lock";
+      const activeLockDir = join(LOCKS_DIR, `${safeStateName(activeLockApp)}.lock`);
+      await ensureDir(activeLockDir);
+      await Deno.writeTextFile(
+        join(activeLockDir, "owner.json"),
+        JSON.stringify({ app: activeLockApp, pid: Deno.pid, startedAt: new Date().toISOString() }, null, 2),
+      );
+      let activeLockMessage = "";
+      try {
+        await withInstallLock(activeLockApp, async () => {});
+      } catch (err) {
+        activeLockMessage = err instanceof Error ? err.message : String(err);
+      } finally {
+        await Deno.remove(activeLockDir, { recursive: true }).catch(() => {});
+      }
+      assertIncludes(activeLockMessage, `Lock: ${activeLockDir}`, "active lock error should include lock path");
+    };
+
+    const testInstallForce = async () => {
+      status("autotest: install first provider");
+      await installApp("alpha/same");
+      status("autotest: install --force reinstalls existing files");
+      const sameBinary = join(APPS_DIR, "same", "1.0", "bin", "same");
+      const sameCache = join(CACHE_DIR, "same#1.0.tar.gz");
+      await Deno.writeTextFile(sameBinary, "corrupted");
+      await Deno.writeTextFile(sameCache, "stale-cache");
+      await installApp("alpha/same", { ignoreBuildCache: true, ignoreDownloadCache: true, forceArtifactBuild: true });
+      const forcedBinary = await Deno.readTextFile(sameBinary);
+      if (forcedBinary !== "alpha-1.0") {
+        throw new Error(`force install should restore binary content, got ${JSON.stringify(forcedBinary)}`);
+      }
+    };
+
+    const testInstallVersion = async () => {
+      status("autotest: install app@version resolves versionSource");
+      await installApp("alpha/same@2.0", { ignoreDownloadCache: true });
+      const installedExactVersion = await installedVersion("same");
+      const exactBinary = await Deno.readTextFile(join(APPS_DIR, "same", "2.0", "bin", "same"));
+      if (installedExactVersion !== "2.0" || exactBinary !== "alpha-2.0") {
+        throw new Error(
+          `install app@version should install 2.0, got version=${installedExactVersion} binary=${exactBinary}`,
+        );
+      }
+      await installApp("alpha/same@1.0", { ignoreDownloadCache: true });
+      const restoredVersion = await installedVersion("same");
+      if (restoredVersion !== "1.0") {
+        throw new Error(`install app@version should restore current version 1.0, got ${restoredVersion}`);
+      }
+    };
+
+    const testVersionSources = async () => {
+      status("autotest: versionSource can merge multiple version spaces");
+      const versions = await discoverVersions("alpha/spaced", (await resolveAppInfo("alpha/spaced")).info);
+      const joined = versions.join(", ");
+      if (joined !== "2.1, 2.0, 1.1, 1.0") {
+        throw new Error(`multi-source versions should be merged and sorted, got ${joined}`);
+      }
+    };
+
+    if (test === "locks") {
+      await testLocks();
+      console.log("autotest passed: locks");
+      return;
+    }
+    if (test === "install-force") {
+      await testInstallForce();
+      console.log("autotest passed: install-force");
+      return;
+    }
+    if (test === "install-version") {
+      await testInstallVersion();
+      console.log("autotest passed: install-version");
+      return;
+    }
+    if (test === "version-sources") {
+      await testVersionSources();
+      console.log("autotest passed: version-sources");
+      return;
+    }
+
+    await testLocks();
+    await testInstallForce();
+    await testInstallVersion();
+    await testVersionSources();
 
     status("autotest: installed listing is deduped and source-qualified");
     const installed = (await installedAppLines(false)).join("\n");
@@ -2693,7 +3184,11 @@ async function runAutotest() {
 
     status("autotest: list --installed uses the same deduped owner view");
     const listInstalled = (await installedAppLines(false)).join("\n");
-    assertIncludes(listInstalled, "alpha/same - alpha source [installed: 1.0]", "list --installed should show the owner");
+    assertIncludes(
+      listInstalled,
+      "alpha/same - alpha source [installed: 1.0]",
+      "list --installed should show the owner",
+    );
     assertNotIncludes(listInstalled, "duplicate/same", "list --installed should not repeat duplicate bucket entries");
 
     status("autotest: upgrade --from-bucket does not use versionSource");
@@ -2707,7 +3202,9 @@ async function runAutotest() {
     await upgradeApps("same", { fromBucket: true });
     const unqualifiedInstalledVersion = await installedVersion("same");
     if (unqualifiedInstalledVersion !== "1.0") {
-      throw new Error(`unqualified installed upgrade should keep alpha/same at 1.0, got ${unqualifiedInstalledVersion}`);
+      throw new Error(
+        `unqualified installed upgrade should keep alpha/same at 1.0, got ${unqualifiedInstalledVersion}`,
+      );
     }
 
     status("autotest: unqualified fresh app is rejected when multiple buckets provide it");
@@ -2717,7 +3214,11 @@ async function runAutotest() {
     } catch (err) {
       ambiguousMessage = err instanceof Error ? err.message : String(err);
     }
-    assertIncludes(ambiguousMessage, "There are multiple 'multi' packages: alpha/multi, duplicate/multi. Specify which one.", "ambiguous app should require bucket/app");
+    assertIncludes(
+      ambiguousMessage,
+      "There are multiple 'multi' packages: alpha/multi, duplicate/multi. Specify which one.",
+      "ambiguous app should require bucket/app",
+    );
 
     status("autotest: versions reports installed, bucket, and source lanes");
     const sourceVersions = await discoverVersions("alpha/same", (await resolveAppInfo("alpha/same")).info);
@@ -2762,9 +3263,17 @@ async function runAutotest() {
     if (!collisionMessage) {
       throw new Error("collision install unexpectedly succeeded");
     }
-    assertIncludes(collisionMessage, "package collision: app directory 'same' is already owned by alpha/same:2.0", "collision should identify the current owner");
+    assertIncludes(
+      collisionMessage,
+      "package collision: app directory 'same' is already owned by alpha/same:2.0",
+      "collision should identify the current owner",
+    );
     const afterCollision = (await installedAppLines(false)).join("\n");
-    assertIncludes(afterCollision, "alpha/same - alpha source [installed: 2.0]", "owner should remain installed after collision");
+    assertIncludes(
+      afterCollision,
+      "alpha/same - alpha source [installed: 2.0]",
+      "owner should remain installed after collision",
+    );
     assertNotIncludes(afterCollision, "beta/same", "failed collision should not appear installed");
 
     status("autotest: update rewrites a local bucket manifest to a requested version");
@@ -2789,7 +3298,11 @@ async function runAutotest() {
     } catch (err) {
       uninstallMessage = err instanceof Error ? err.message : String(err);
     }
-    assertIncludes(uninstallMessage, "There are multiple installed versions of 'same': 2.0, 1.0. Specify which one, or use --all.", "uninstall should require a version when multiple versions exist");
+    assertIncludes(
+      uninstallMessage,
+      "There are multiple installed versions of 'same': 2.0, 1.0. Specify which one, or use --all.",
+      "uninstall should require a version when multiple versions exist",
+    );
     await uninstallApp("same@2.0");
     const afterSpecificUninstall = await installedVersions("same");
     if (afterSpecificUninstall.join(", ") !== "1.0") {
@@ -2820,20 +3333,37 @@ await new Command()
     }
     this.showHelp();
   })
-  .globalOption("-v, --verbose", "Increase verbosity", { collect: true, value: () => { VERBOSITY++; return VERBOSITY; } })
-  .globalOption("-q, --quiet", "Decrease verbosity", { collect: true, value: () => { QUIET++; return QUIET; } })
+  .globalOption("-v, --verbose", "Increase verbosity", {
+    collect: true,
+    value: () => {
+      VERBOSITY++;
+      return VERBOSITY;
+    },
+  })
+  .globalOption("-q, --quiet", "Decrease verbosity", {
+    collect: true,
+    value: () => {
+      QUIET++;
+      return QUIET;
+    },
+  })
   .command("autotest [test:string]", "Run built-in tests")
   .action(async (_opts, test) => {
-    if (test && test !== "all") {
-      console.error(`Unknown autotest '${test}'. Available: all`);
+    try {
+      await runAutotest(test ?? "all");
+    } catch (err) {
+      error("Autotest failed");
+      console.error(`Reason: ${err instanceof Error ? err.message : String(err)}`);
       Deno.exit(1);
     }
-    await runAutotest();
   })
   .command("install <app:string>", "Install an app from all buckets")
+  .option("--version <version:string>", "Install this exact discovered version")
+  .option("-f, --force", "Force reinstall, ignoring download/build/artifact caches")
   .option("--ignore-build-cache", "Force rebuild from source, ignoring cached Docker image")
   .option("--ignore-download-cache", "Force re-download even if cached")
   .option("--force-artifact-build", "Force rebuilding artifact outputs even if cached")
+  .option("--aria2", "Use aria2c for HTTP(S) downloads instead of the built-in downloader")
   .option("--keep-temp", "Keep extracted files in ~/.scoopix/temp/<app>")
   .option("--system", "Run system install commands after building, requires root")
   .option("--no-autoconfig", "Do not configure ~/.scoopix/bin on PATH after install")
@@ -2851,9 +3381,11 @@ await new Command()
           Deno.exit(1);
         }
         await installApp(app, {
-          ignoreBuildCache: opts.ignoreBuildCache,
-          ignoreDownloadCache: opts.ignoreDownloadCache,
-          forceArtifactBuild: opts.forceArtifactBuild,
+          ignoreBuildCache: opts.force || opts.ignoreBuildCache,
+          ignoreDownloadCache: opts.force || opts.ignoreDownloadCache,
+          forceArtifactBuild: opts.force || opts.forceArtifactBuild,
+          version: opts.version,
+          aria2: opts.aria2,
           keepTemp: opts.keepTemp,
           system: opts.system,
         });
@@ -2866,7 +3398,9 @@ await new Command()
         console.log(`System install complete for '${app}'.`);
       }
     } catch (err) {
-      await writeInstallState(app, "failed", { reason: err instanceof Error ? err.message : String(err) }).catch(() => {});
+      await writeInstallState(app, "failed", { reason: err instanceof Error ? err.message : String(err) }).catch(
+        () => {},
+      );
       error(`Install failed: ${app}`);
       console.error(`Reason: ${err instanceof Error ? err.message : String(err)}`);
       if (VERBOSITY - QUIET >= 2 && err instanceof Error && err.stack) {
@@ -2918,7 +3452,10 @@ await new Command()
       Deno.exit(1);
     }
   })
-  .command("update <app:string> <version:string>", "Update a local bucket manifest entry to a specific discovered version")
+  .command(
+    "update <app:string> <version:string>",
+    "Update a local bucket manifest entry to a specific discovered version",
+  )
   .action(async (_opts, app, version) => {
     try {
       await updateManifestAppVersion(app, version);
@@ -2970,20 +3507,30 @@ await new Command()
     }
   })
   .command("run <app:string> <script:string>", "Run a package script")
-  .action(async (_opts, app, script) => { await runPackageScriptAction(app, script); })
-  .command("bucket", new Command()
-    .description("Manage buckets")
-    .action(function () { this.showHelp(); })
-    .command("add <url:string> [name:string]", "Add a bucket manifest from url")
-    .action(async (_opts, url, name) => { await addBucket(url, name); })
-    .command("rm <name:string>", "Remove a configured bucket")
-    .action(async (_opts, name) => { await removeBucket(name); })
-    .command("list", "List available buckets")
-    .action(async () => {
-      await ensureDefaultMainBucket();
-      const buckets = await listBuckets();
-      for (const b of buckets) console.log(b);
-    })
+  .action(async (_opts, app, script) => {
+    await runPackageScriptAction(app, script);
+  })
+  .command(
+    "bucket",
+    new Command()
+      .description("Manage buckets")
+      .action(function () {
+        this.showHelp();
+      })
+      .command("add <url:string> [name:string]", "Add a bucket manifest from url")
+      .action(async (_opts, url, name) => {
+        await addBucket(url, name);
+      })
+      .command("rm <name:string>", "Remove a configured bucket")
+      .action(async (_opts, name) => {
+        await removeBucket(name);
+      })
+      .command("list", "List available buckets")
+      .action(async () => {
+        await ensureDefaultMainBucket();
+        const buckets = await listBuckets();
+        for (const b of buckets) console.log(b);
+      }),
   )
   .command("list", "List all apps in all buckets")
   .option("--full", "Show full bucket path")
@@ -3016,22 +3563,26 @@ await new Command()
   .action(async (_opts, app) => {
     await checkVersion(app);
   })
-  .command("config", new Command()
-    .description("Configure Scoopix")
-    .action(function () { this.showHelp(); })
-    .command("path [shell:string]", "Configure Scoopix app commands on PATH")
-    .option("--remove", "Remove Scoopix app commands from PATH")
-    .option("--shell-only", "Only configure shell startup files; on Windows, do not update the Windows user PATH")
-    .action(async (opts, shell) => {
-      try {
-        await configurePath(shell, { shellOnly: opts.shellOnly, remove: opts.remove });
-        if (!opts.remove) printCurrentShellActivationHint(shell);
-      } catch (err) {
-        error("Config path failed");
-        console.error(`Reason: ${err instanceof Error ? err.message : String(err)}`);
-        Deno.exit(1);
-      }
-    })
+  .command(
+    "config",
+    new Command()
+      .description("Configure Scoopix")
+      .action(function () {
+        this.showHelp();
+      })
+      .command("path [shell:string]", "Configure Scoopix app commands on PATH")
+      .option("--remove", "Remove Scoopix app commands from PATH")
+      .option("--shell-only", "Only configure shell startup files; on Windows, do not update the Windows user PATH")
+      .action(async (opts, shell) => {
+        try {
+          await configurePath(shell, { shellOnly: opts.shellOnly, remove: opts.remove });
+          if (!opts.remove) printCurrentShellActivationHint(shell);
+        } catch (err) {
+          error("Config path failed");
+          console.error(`Reason: ${err instanceof Error ? err.message : String(err)}`);
+          Deno.exit(1);
+        }
+      }),
   )
   .command("system-info", "Show system architecture and distribution")
   .action(async () => {
