@@ -48,10 +48,10 @@
     "homepage": "https://micro-editor.github.io/",
     "license": "MIT",
     "type": "bin",
-    "versionSource": {
+    "versionsFinder": {
       "url": "https://api.github.com/repos/zyedidia/micro/releases",
       "type": "github-releases",
-      "versionRegex": "^v?(\\d+\\.\\d+\\.\\d+)$"
+      "pattern": "^v?(\\d+\\.\\d+\\.\\d+)$"
     },
     "healthcheck": {
       "command": "{target}",
@@ -91,10 +91,18 @@
     "homepage": "https://www.arangodb.com/",
     "license": "Apache-2.0",
     "type": "bin",
-    "versionSource": {
-      "url": "https://download.arangodb.com/arangodb311/Community/Windows/",
-      "versionRegex": "ArangoDB3-(3\\.11\\.\\d+(?:-\\d+)?)_win64\\.zip"
-    },
+    "versionsFinder": [
+      {
+        "type": "web-regex",
+        "url": "https://download.arangodb.com/arangodb311/Community/Windows/",
+        "pattern": "ArangoDB3-(3\\.11\\.\\d+(?:-\\d+)?)_win64\\.zip"
+      },
+      {
+        "type": "web-regex",
+        "url": "https://download.arangodb.com/arangodb312/Community/Linux/",
+        "pattern": "arangodb3-linux-(3\\.12\\.\\d+(?:-\\d+)?)_x86_64\\.tar\\.gz"
+      }
+    ],
     "arch": {
       "windows-x86_64": {
         "url": "https://download.arangodb.com/arangodb311/Community/Windows/ArangoDB3-3.11.14_win64.zip",
@@ -125,9 +133,9 @@
     "homepage": "https://www.arangodb.com/",
     "license": "Apache-2.0",
     "type": "bin",
-    "versionSource": {
+    "versionsFinder": {
       "url": "https://download.arangodb.com/arangodb312/Community/Linux/index.html",
-      "versionRegex": "arangodb3-linux-(3\\.12\\.\\d+(?:-\\d+)?)_x86_64\\.tar\\.gz"
+      "pattern": "arangodb3-linux-(3\\.12\\.\\d+(?:-\\d+)?)_x86_64\\.tar\\.gz"
     },
     "arch": {
       "linux-x86_64": {
@@ -146,16 +154,14 @@
     "license": "MIT",
     "type": "src",
     "url": "https://github.com/raisercostin/scripts/blob/main/rtee.rs",
-    "versionSource": {
+    "versionsFinder": {
       "type": "git-log"
     },
+    "srcVersionDetector": {
+      "type": "regex",
+      "pattern": "const VERSION: &str = \"([^\"]+)\";"
+    },
     "rustc": {},
-    "sourceReplacements": [
-      {
-        "pattern": "const VERSION: &str = \"[^\"]*\";",
-        "replacement": "const VERSION: &str = \"{version}\";"
-      }
-    ],
     "healthcheck": {
       "command": "{target}",
       "args": ["--version"],

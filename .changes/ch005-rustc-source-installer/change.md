@@ -21,10 +21,10 @@ Compiling a remote Rust file creates a native executable that runs with the user
 - Added `rustc` source backend metadata to `ScoopixApp`.
 - Added `--approve-rustc-build` to `install` and `upgrade`.
 - Added a local `rustc` build path that downloads/caches the `.rs` source, runs `rustc -O -o <dest>`, and links the generated executable.
-- Added Git-backed source metadata (`git`, `ref`, `path`) and `git-log` version discovery for source files.
+- Added package-level `versionsFinder` metadata, including `git-log` version discovery for source files and multi `web-regex` discovery for split upstream indexes.
 - Added single-URL Git source conventions: GitHub blob URLs are parsed as a convenience, and provider-agnostic `git+<repo-url>#<ref>:<path>` URLs can identify scripts from any Git host/protocol.
 - Added derived Git install versions in the form `<declared-version>-<yyyymmdd>.<commit-count>.<ref>.g<short-sha>`.
-- Added source replacement support so build metadata can be injected before compilation.
+- Added source replacement support and `srcVersionDetector`, which extracts the formal source version and by default replaces that captured version with the derived build version before compilation.
 - Added installed app provenance metadata and `scoopix info <app>` for Git commit/build details.
 - Added `main/rtee`, sourced from `https://github.com/raisercostin/scripts/blob/main/rtee.rs` with homepage `https://github.com/raisercostin/scripts/blob/main/rtee.md`.
 

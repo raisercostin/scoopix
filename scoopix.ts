@@ -146,16 +146,17 @@ export interface ScoopixDocker {
   output: string;
 }
 
-export interface ScoopixVersionSource {
+export interface ScoopixVersionsFinder {
   url?: string;
-  type?: "github-releases" | "text" | "git-log";
+  type?: "github-releases" | "web-regex" | "text" | "git-log";
+  pattern?: string;
   versionRegex?: string;
   includePrerelease?: boolean;
   path?: string;
   ref?: string;
 }
 
-export type ScoopixVersionSources = ScoopixVersionSource | ScoopixVersionSource[];
+export type ScoopixVersionsFinders = ScoopixVersionsFinder | ScoopixVersionsFinder[];
 
 export interface ScoopixHealthcheck {
   command?: string;
@@ -167,6 +168,13 @@ export interface ScoopixHealthcheck {
 export interface ScoopixSourceReplacement {
   pattern: string;
   replacement: string;
+}
+
+export interface ScoopixSrcVersionDetector {
+  type?: "regex";
+  pattern?: string;
+  regex?: string;
+  replacement?: string;
 }
 
 export interface ScoopixApp {
@@ -188,11 +196,12 @@ export interface ScoopixApp {
   extractRoot?: string;
   bin?: ScoopixBinary;
   shim?: string;
-  versionSource?: ScoopixVersionSources;
+  versionsFinder?: ScoopixVersionsFinders;
   healthcheck?: ScoopixHealthcheck;
   arch?: Record<string, ScoopixArchEntry>;
   docker?: ScoopixDocker;
   rustc?: { args?: string[] };
+  srcVersionDetector?: ScoopixSrcVersionDetector;
   sourceReplacements?: ScoopixSourceReplacement[];
 }
 
@@ -643,43 +652,44 @@ function uniqueSortedVersions(versions: string[]): string[] {
   return [...new Set(versions.filter(Boolean))].sort((a, b) => compareVersionStrings(b, a));
 }
 
-async function discoverVersionsFromSource(source: ScoopixVersionSource): Promise<string[]> {
-  if (!source.url || !source.versionRegex) throw new Error("text/github versionSource requires url and versionRegex");
+async function discoverVersionsFromFinder(source: ScoopixVersionsFinder): Promise<string[]> {
+  const pattern = source.pattern ?? source.versionRegex;
+  if (!source.url || !pattern) throw new Error("web/github versionsFinder requires url and pattern");
   const response = await fetch(source.url);
-  if (!response.ok) throw new Error(`versionSource fetch failed: HTTP ${response.status} ${response.statusText}`);
+  if (!response.ok) throw new Error(`versionsFinder fetch failed: HTTP ${response.status} ${response.statusText}`);
   const text = await response.text();
 
-  if ((source.type ?? "text") === "github-releases") {
+  if ((source.type ?? "web-regex") === "github-releases") {
     const releases = JSON.parse(text);
     const tags = Array.isArray(releases)
       ? releases
         .filter((release) => source.includePrerelease || (!release.draft && !release.prerelease))
         .map((release) => String(release.tag_name ?? ""))
       : [String(releases.tag_name ?? "")];
-    return collectVersionsFromText(tags.filter(Boolean).join("\n"), source.versionRegex);
+    return collectVersionsFromText(tags.filter(Boolean).join("\n"), pattern);
   }
 
-  return collectVersionsFromText(text, source.versionRegex);
+  return collectVersionsFromText(text, pattern);
 }
 
 async function discoverVersions(appId: string, infoObj: ScoopixApp): Promise<string[]> {
-  const versionSource = infoObj.versionSource;
-  if (!versionSource && sourceGitInfo(infoObj)) {
+  const versionsFinder = infoObj.versionsFinder;
+  if (!versionsFinder && sourceGitInfo(infoObj)) {
     return uniqueSortedVersions(await discoverGitFileVersions(appId.split("/").pop() ?? appId, infoObj));
   }
-  if (!versionSource) {
-    error(`versions: '${appId}' has no versionSource in the loaded manifest`);
-    console.error("Add versionSource to the bucket manifest, or refresh/use a bucket that contains it.");
+  if (!versionsFinder) {
+    error(`versions: '${appId}' has no versionsFinder in the loaded manifest`);
+    console.error("Add versionsFinder to the bucket manifest, or refresh/use a bucket that contains it.");
     Deno.exit(1);
   }
 
-  const sources = Array.isArray(versionSource) ? versionSource : [versionSource];
+  const sources = Array.isArray(versionsFinder) ? versionsFinder : [versionsFinder];
   const versions: string[] = [];
   for (const source of sources) {
-    if ((source.type ?? "text") === "git-log") {
+    if ((source.type ?? "web-regex") === "git-log") {
       versions.push(...await discoverGitFileVersions(appId.split("/").pop() ?? appId, infoObj, source));
     } else {
-      versions.push(...await discoverVersionsFromSource(source));
+      versions.push(...await discoverVersionsFromFinder(source));
     }
   }
   return uniqueSortedVersions(versions);
@@ -691,7 +701,7 @@ function replaceVersionInValue(value: unknown, oldVersion: string, newVersion: s
   if (value && typeof value === "object") {
     const result: Record<string, unknown> = {};
     for (const [key, child] of Object.entries(value)) {
-      if (key === "versionSource") {
+      if (key === "versionsFinder") {
         result[key] = child;
         continue;
       }
@@ -720,7 +730,7 @@ async function updateManifestAppVersion(app: string, requestedVersion: string) {
     const versions = await discoverVersions(appId, infoObj);
     if (!versions.includes(requestedVersion)) {
       throw new Error(
-        `${appId}: version ${requestedVersion} was not found in versionSource. Available: ${versions.join(", ")}`,
+        `${appId}: version ${requestedVersion} was not found in versionsFinder. Available: ${versions.join(", ")}`,
       );
     }
     if (oldVersion === requestedVersion) {
@@ -862,7 +872,7 @@ async function resolveUpgradeTarget(app: string, opts: any = {}): Promise<{
     throw new Error("--from-bucket cannot be combined with an explicit version");
   }
 
-  if (opts.fromBucket || (!requestedVersion && !infoObj.versionSource)) {
+  if (opts.fromBucket || (!requestedVersion && !infoObj.versionsFinder)) {
     return {
       app: baseApp,
       appName,
@@ -879,7 +889,7 @@ async function resolveUpgradeTarget(app: string, opts: any = {}): Promise<{
   const targetVersion = requestedVersion ?? versions[0] ?? bucketVersion;
   if (requestedVersion && !versions.includes(requestedVersion)) {
     throw new Error(
-      `${appId}: version ${requestedVersion} was not found in versionSource. Available: ${versions.join(", ")}`,
+      `${appId}: version ${requestedVersion} was not found in versionsFinder. Available: ${versions.join(", ")}`,
     );
   }
   if (targetVersion === bucketVersion) {
@@ -902,7 +912,7 @@ async function printVersions(app: string) {
   for (const [index, { appName, info: infoObj, bucket }] of matches.entries()) {
     const version = infoObj.version ?? "unknown";
     const appId = `${bucket}/${appName}`;
-    const sourceVersions = infoObj.versionSource ? await discoverVersions(appId, infoObj) : [];
+    const sourceVersions = infoObj.versionsFinder || sourceGitInfo(infoObj) ? await discoverVersions(appId, infoObj) : [];
     const bucketHistory = await bucketVersionHistory(bucket, appName, version);
     const current = await installedVersion(appName);
     const installed = await installedVersions(appName);
@@ -1317,11 +1327,13 @@ async function prepareGitSource(appName: string, declaredVersion: string, infoOb
   const signatureStatus = await gitOutput(["show", "-s", "--format=%G?", "HEAD"], repoDir).catch(() => "unknown");
   const signatureKey = await gitOutput(["show", "-s", "--format=%GK", "HEAD"], repoDir).catch(() => "");
   const safeRef = safeVersionPart(ref.replace(/^refs\/heads\//, "").replace(/^origin\//, ""));
-  const version = `${declaredVersion}-${date}.${count}.${safeRef}.g${shortSha}`;
+  const sourcePath = join(repoDir, path);
+  const formalVersion = await formalSourceVersion(sourcePath, infoObj);
+  const version = `${formalVersion}-${date}.${count}.${safeRef}.g${shortSha}`;
   return {
-    sourcePath: join(repoDir, path),
+    sourcePath,
     version,
-    git: { ref, fullSha, shortSha, count, date, isoDate, subject, authorName, authorEmail, committerName, committerEmail, signatureStatus, signatureKey },
+    git: { ref, fullSha, shortSha, count, date, isoDate, subject, authorName, authorEmail, committerName, committerEmail, signatureStatus, signatureKey, formalVersion, manifestVersion: declaredVersion },
   };
 }
 
@@ -1345,7 +1357,25 @@ function gitDerivedVersion(declaredVersion: string, date: string, count: string,
   return `${declaredVersion}-${date}.${count}.${safeVersionPart(ref)}.g${shortSha}`;
 }
 
-async function discoverGitFileVersions(appName: string, infoObj: ScoopixApp, source?: ScoopixVersionSource): Promise<string[]> {
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function formalSourceVersion(sourcePath: string, infoObj: ScoopixApp): Promise<string> {
+  const detector = infoObj.srcVersionDetector;
+  if (!detector) return infoObj.version;
+  const text = await Deno.readTextFile(sourcePath);
+  const pattern = detector.pattern ?? detector.regex;
+  if (!pattern) throw new Error(`srcVersionDetector for ${sourcePath} requires pattern`);
+  const match = text.match(new RegExp(pattern, "m"));
+  const version = match?.[1] ?? match?.[0];
+  if (!version) {
+    throw new Error(`srcVersionDetector pattern did not match ${sourcePath}: ${pattern}`);
+  }
+  return version;
+}
+
+async function discoverGitFileVersions(appName: string, infoObj: ScoopixApp, source?: ScoopixVersionsFinder): Promise<string[]> {
   const sourceInfo = sourceGitInfo(infoObj);
   if (!sourceInfo) return [];
   const ref = source?.ref ?? sourceInfo.ref;
@@ -1366,7 +1396,15 @@ async function discoverGitFileVersions(appName: string, infoObj: ScoopixApp, sou
     const [fullSha, shortSha, date] = line.split("\t");
     if (!fullSha || !shortSha || !date) continue;
     const count = await gitOutput(["rev-list", "--count", fullSha], repoDir);
-    versions.push(gitDerivedVersion(infoObj.version, date, count, safeRef, shortSha));
+    const formalVersion = infoObj.srcVersionDetector
+      ? await gitOutput(["show", `${fullSha}:${filePath}`], repoDir).then(async (text) => {
+        const tempPath = join(TEMP_DIR, appName, `${safeStateName(fullSha)}.version-source`);
+        await ensureDir(dirname(tempPath));
+        await Deno.writeTextFile(tempPath, text);
+        return await formalSourceVersion(tempPath, infoObj);
+      })
+      : infoObj.version;
+    versions.push(gitDerivedVersion(formalVersion, date, count, safeRef, shortSha));
   }
   return versions;
 }
@@ -1388,10 +1426,25 @@ async function buildSourcePlaceholders(appName: string, version: string, infoObj
 }
 
 async function applySourceReplacements(sourcePath: string, appName: string, version: string, infoObj: ScoopixApp, gitMeta: any) {
-  if (!infoObj.sourceReplacements?.length) return sourcePath;
+  const detector = infoObj.srcVersionDetector;
+  if (!detector && !infoObj.sourceReplacements?.length) return sourcePath;
   let text = await Deno.readTextFile(sourcePath);
   const placeholders = await buildSourcePlaceholders(appName, version, infoObj, gitMeta);
-  for (const entry of infoObj.sourceReplacements) {
+  if (detector) {
+    const pattern = detector.pattern ?? detector.regex;
+    if (!pattern) throw new Error(`srcVersionDetector for ${sourcePath} requires pattern`);
+    const replacement = expandPlaceholders(detector.replacement ?? "{version}", placeholders);
+    let replaced = false;
+    text = text.replace(new RegExp(pattern, "m"), (match, firstCapture: string) => {
+      if (typeof firstCapture !== "string") {
+        throw new Error(`srcVersionDetector pattern must capture the formal version: ${pattern}`);
+      }
+      replaced = true;
+      return match.replace(new RegExp(`(${escapeRegExp(firstCapture)})`), replacement);
+    });
+    if (!replaced) throw new Error(`srcVersionDetector pattern did not match ${sourcePath}: ${pattern}`);
+  }
+  for (const entry of infoObj.sourceReplacements ?? []) {
     text = text.replace(new RegExp(entry.pattern, "g"), expandPlaceholders(entry.replacement, placeholders));
   }
   const buildSource = join(TEMP_DIR, appName, `${safeStateName(appName)}.rs`);
@@ -1445,6 +1498,8 @@ async function buildRustWithLocalRustc(appName: string, version: string, infoObj
     shortCommit: opts.git?.shortSha,
     commitCount: opts.git?.count,
     commitDate: opts.git?.isoDate,
+    formalVersion: opts.git?.formalVersion,
+    manifestVersion: opts.git?.manifestVersion ?? infoObj.version,
     authorName: opts.git?.authorName,
     authorEmail: opts.git?.authorEmail,
     committerName: opts.git?.committerName,
@@ -1585,7 +1640,7 @@ async function installApp(app: string, opts: any = {}) {
     const versions = await discoverVersions(appId, resolved.info);
     if (!versions.includes(requestedVersion)) {
       throw new Error(
-        `${appId}: version ${requestedVersion} was not found in versionSource. Available: ${versions.join(", ")}`,
+        `${appId}: version ${requestedVersion} was not found in versionsFinder. Available: ${versions.join(", ")}`,
       );
     }
     infoObj = replaceVersionInValue(resolved.info, resolved.version, requestedVersion) as ScoopixApp;
@@ -3304,9 +3359,9 @@ async function runAutotest(test = "all") {
           url: "data:text/plain,alpha-1.0",
           bin: "same",
           description: "alpha source",
-          versionSource: {
+          versionsFinder: {
             url: "data:text/plain,2.0%0A1.0",
-            versionRegex: "^(\\d+\\.\\d+)$",
+            pattern: "^(\\d+\\.\\d+)$",
           },
         },
         spaced: {
@@ -3314,14 +3369,14 @@ async function runAutotest(test = "all") {
           url: "data:text/plain,spaced-1.0",
           bin: "spaced",
           description: "multi-space version source candidate",
-          versionSource: [
+          versionsFinder: [
             {
               url: "data:text/plain,1.0%0A1.1",
-              versionRegex: "^(\\d+\\.\\d+)$",
+              pattern: "^(\\d+\\.\\d+)$",
             },
             {
               url: "data:text/plain,2.0%0A2.1",
-              versionRegex: "^(\\d+\\.\\d+)$",
+              pattern: "^(\\d+\\.\\d+)$",
             },
           ],
         },
@@ -3417,7 +3472,7 @@ async function runAutotest(test = "all") {
     };
 
     const testInstallVersion = async () => {
-      status("autotest: install app@version resolves versionSource");
+      status("autotest: install app@version resolves versionsFinder");
       await installApp("alpha/same@2.0", { ignoreDownloadCache: true });
       const installedExactVersion = await installedVersion("same");
       const exactBinary = await Deno.readTextFile(join(APPS_DIR, "same", "2.0", "bin", "same"));
@@ -3434,7 +3489,7 @@ async function runAutotest(test = "all") {
     };
 
     const testVersionSources = async () => {
-      status("autotest: versionSource can merge multiple version spaces");
+      status("autotest: versionsFinder can merge multiple version spaces");
       const versions = await discoverVersions("alpha/spaced", (await resolveAppInfo("alpha/spaced")).info);
       const joined = versions.join(", ");
       if (joined !== "2.1, 2.0, 1.1, 1.0") {
@@ -3486,7 +3541,7 @@ async function runAutotest(test = "all") {
     );
     assertNotIncludes(listInstalled, "duplicate/same", "list --installed should not repeat duplicate bucket entries");
 
-    status("autotest: upgrade --from-bucket does not use versionSource");
+    status("autotest: upgrade --from-bucket does not use versionsFinder");
     await upgradeApps("alpha/same", { fromBucket: true });
     const strictBucketVersion = await installedVersion("same");
     if (strictBucketVersion !== "1.0") {
@@ -3709,7 +3764,7 @@ await new Command()
   .command("upgrade [app:string]", "Upgrade one installed app, or all installed apps")
   .option("--version <version:string>", "Install this exact discovered version")
   .option("--from-bucket", "Use only the bucket manifest version")
-  .option("--from-source", "Use versionSource when available (default)")
+  .option("--from-source", "Use versionsFinder when available (default)")
   .option("--update-bucket-manifest", "Persist the resolved version back to the local bucket manifest")
   .option("--force-bucket-update", "Run git pull --ff-only for matching local git-backed buckets before resolving")
   .option("--ignore-build-cache", "Force rebuild from source, ignoring cached Docker image")

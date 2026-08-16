@@ -7,7 +7,7 @@ The core idea is simple: a bucket is a JSON catalog, each app describes where it
 Scoopix has evolved from "Scoop for Synology/Linux" into a more general installer layer:
 
 - It can install downloaded binaries, extracted application trees, source-built binaries, delegated recipes, system-assisted packages, and metadata-like packages such as shell configuration or future completion targets.
-- It separates package identity from upstream version discovery. A manifest can pin a known-good bucket version while `versionSource` discovers newer or older upstream versions on demand.
+- It separates package identity from upstream version discovery. A manifest can pin a known-good bucket version while `versionsFinder` discovers newer or older upstream versions on demand.
 - It supports exact version installs with `app@version` and `--version`, force reinstalls, cached downloads, and local bucket manifest updates when you intentionally want to persist a resolved version.
 - It treats buckets as editable infrastructure. A local bucket can be a project file, a Git repo, or a remote raw JSON file; Scoopix can use the loaded bucket, source discovery, and local Git history as separate version lanes.
 - It is intentionally user-local by default, but can run selected system operations when a package explicitly needs them, such as Synology WireGuard installation.
@@ -20,7 +20,7 @@ Think of Scoopix less as a distro package manager and more as a portable install
 - **User-local installs** – binaries go under `~/.scoopix`, isolated from system packages.
 - **Cross-platform** – runs on Linux, WSL2, Synology DSM, Entware, and more.
 - **Version lanes** – installed, saved, bucket, source-discovered, and git-backed bucket history can be inspected separately.
-- **Exact versions** – install or upgrade with `bucket/app@version` or `--version` when a manifest has `versionSource`.
+- **Exact versions** – install or upgrade with `bucket/app@version` or `--version` when a manifest has `versionsFinder`.
 - **Source builds via Docker** – if no binary is available, Scoopix can build from source inside a Docker container.
 - **Artifact-shaped installs** – packages can preserve extracted trees and expose several command shims from one archive.
 - **Synology WireGuard from source** – one command can build the `wg` userspace tool and a Synology WireGuard kernel-module SPK instead of relying on an opaque third-party package.
@@ -162,7 +162,7 @@ micro
 scoopix upgrade micro
 ```
 
-By default, Scoopix uses the bucket manifest and, when the manifest has `versionSource`, resolves the latest upstream version without mutating the bucket file. Use `app@version` or `--version` to install an exact discovered version, including downgrades:
+By default, Scoopix uses the bucket manifest and, when the manifest has `versionsFinder`, resolves the latest upstream version without mutating the bucket file. Use `app@version` or `--version` to install an exact discovered version, including downgrades:
 
 ```bash
 scoopix upgrade micro@2.0.15
@@ -175,7 +175,7 @@ Use `versions` to see where version information comes from:
 scoopix versions micro
 ```
 
-It reports three sources: `installed`, `bucket`, and `source`. Bucket manifests may keep a bounded curated history, for example the last 3 major versions, 3 minor versions per major, and 3 patch versions per minor. When a bucket is local and git-backed, Scoopix can also recover older bucket versions from git history. `source` is realtime discovery from `versionSource`.
+It reports three sources: `installed`, `bucket`, and `source`. Bucket manifests may keep a bounded curated history, for example the last 3 major versions, 3 minor versions per major, and 3 patch versions per minor. When a bucket is local and git-backed, Scoopix can also recover older bucket versions from git history. `source` is realtime discovery from `versionsFinder`.
 
 Save preferred versions outside buckets when you want a portable list to share or move between machines:
 
@@ -193,7 +193,7 @@ Use strict bucket mode when you want reproducible manifest-only installs:
 scoopix upgrade micro --from-bucket
 ```
 
-Use `--update-bucket-manifest` to persist the resolved version back into a local bucket manifest. This rewrites versioned artifact URLs and paths, but leaves `versionSource` unchanged:
+Use `--update-bucket-manifest` to persist the resolved version back into a local bucket manifest. This rewrites versioned artifact URLs and paths, but leaves `versionsFinder` unchanged:
 
 ```bash
 scoopix upgrade micro@2.0.15 --update-bucket-manifest
@@ -283,7 +283,7 @@ Working now:
 
 * `install` creates versioned app installs, a stable `current` link, and command shims in `~/.scoopix/bin`.
 * `config path` configures both shell startup files and, on Windows, the Windows user `PATH`; `--remove` reverses only Scoopix PATH entries.
-* `upgrade micro` follows the installed owner bucket and can upgrade from upstream `versionSource`.
+* `upgrade micro` follows the installed owner bucket and can upgrade from upstream `versionsFinder`.
 * Manifest `healthcheck` can verify the installed target after install or upgrade.
 
 Remaining work:
