@@ -147,10 +147,12 @@ export interface ScoopixDocker {
 }
 
 export interface ScoopixVersionSource {
-  url: string;
-  type?: "github-releases" | "text";
-  versionRegex: string;
+  url?: string;
+  type?: "github-releases" | "text" | "git-log";
+  versionRegex?: string;
   includePrerelease?: boolean;
+  path?: string;
+  ref?: string;
 }
 
 export type ScoopixVersionSources = ScoopixVersionSource | ScoopixVersionSource[];
@@ -160,6 +162,11 @@ export interface ScoopixHealthcheck {
   args?: string[];
   match?: string;
   stream?: "stdout" | "stderr" | "combined";
+}
+
+export interface ScoopixSourceReplacement {
+  pattern: string;
+  replacement: string;
 }
 
 export interface ScoopixApp {
@@ -173,6 +180,9 @@ export interface ScoopixApp {
   depends?: string[];
   type?: "bin" | "src" | "meta";
   url?: string;
+  git?: string;
+  ref?: string;
+  path?: string;
   urls?: string[];
   extract?: "zip" | "tar.gz" | "tgz";
   extractRoot?: string;
@@ -182,6 +192,8 @@ export interface ScoopixApp {
   healthcheck?: ScoopixHealthcheck;
   arch?: Record<string, ScoopixArchEntry>;
   docker?: ScoopixDocker;
+  rustc?: { args?: string[] };
+  sourceReplacements?: ScoopixSourceReplacement[];
 }
 
 export type ScoopixManifest = Record<string, ScoopixApp>;
@@ -201,6 +213,7 @@ type AppState = {
   owner: string;
   version: string;
   updatedAt: string;
+  provenance?: Record<string, unknown>;
 };
 
 type SavedVersion = {
@@ -631,6 +644,7 @@ function uniqueSortedVersions(versions: string[]): string[] {
 }
 
 async function discoverVersionsFromSource(source: ScoopixVersionSource): Promise<string[]> {
+  if (!source.url || !source.versionRegex) throw new Error("text/github versionSource requires url and versionRegex");
   const response = await fetch(source.url);
   if (!response.ok) throw new Error(`versionSource fetch failed: HTTP ${response.status} ${response.statusText}`);
   const text = await response.text();
@@ -650,6 +664,9 @@ async function discoverVersionsFromSource(source: ScoopixVersionSource): Promise
 
 async function discoverVersions(appId: string, infoObj: ScoopixApp): Promise<string[]> {
   const versionSource = infoObj.versionSource;
+  if (!versionSource && infoObj.git && infoObj.path) {
+    return uniqueSortedVersions(await discoverGitFileVersions(appId.split("/").pop() ?? appId, infoObj));
+  }
   if (!versionSource) {
     error(`versions: '${appId}' has no versionSource in the loaded manifest`);
     console.error("Add versionSource to the bucket manifest, or refresh/use a bucket that contains it.");
@@ -659,7 +676,11 @@ async function discoverVersions(appId: string, infoObj: ScoopixApp): Promise<str
   const sources = Array.isArray(versionSource) ? versionSource : [versionSource];
   const versions: string[] = [];
   for (const source of sources) {
-    versions.push(...await discoverVersionsFromSource(source));
+    if ((source.type ?? "text") === "git-log") {
+      versions.push(...await discoverGitFileVersions(appId.split("/").pop() ?? appId, infoObj, source));
+    } else {
+      versions.push(...await discoverVersionsFromSource(source));
+    }
   }
   return uniqueSortedVersions(versions);
 }
@@ -916,6 +937,42 @@ async function checkVersion(app: string) {
   console.log(`${appId}: ${status}`);
   console.log(`manifest: ${version}`);
   console.log(`latest:   ${latest}`);
+}
+
+async function printAppInfo(app: string) {
+  const parsed = parseVersionedAppSpec(app);
+  const appName = parsed.app.includes("/") ? parsed.app.split("/").pop()! : parsed.app;
+  const state = await readAppState(appName);
+  if (!state) {
+    console.error(`'${app}' is not installed.`);
+    Deno.exit(1);
+  }
+  console.log(`${state.owner}:${state.version}`);
+  console.log(`installed at: ${state.updatedAt}`);
+  const provenance = state.provenance ?? {};
+  if (Object.keys(provenance).length === 0) {
+    console.log("provenance: <none>");
+    return;
+  }
+  const print = (label: string, value: unknown) => {
+    if (value !== undefined && value !== null && value !== "") console.log(`${label}: ${value}`);
+  };
+  print("source type", provenance.sourceType);
+  print("source", provenance.git ?? provenance.url);
+  print("ref", provenance.ref);
+  print("path", provenance.path);
+  print("commit", provenance.commit);
+  print("commit date", provenance.commitDate);
+  print("commit count", provenance.commitCount);
+  print("author", provenance.authorName && provenance.authorEmail ? `${provenance.authorName} <${provenance.authorEmail}>` : undefined);
+  print("committer", provenance.committerName && provenance.committerEmail ? `${provenance.committerName} <${provenance.committerEmail}>` : undefined);
+  print("subject", provenance.subject);
+  print("signature", provenance.signatureStatus);
+  print("signature key", provenance.signatureKey);
+  print("builder", provenance.builder);
+  print("rustc", provenance.rustc);
+  print("built at", provenance.buildTime);
+  print("built by", provenance.buildUser && provenance.buildHost ? `${provenance.buildUser}@${provenance.buildHost}` : undefined);
 }
 
 async function installedVersion(appName: string): Promise<string | null> {
@@ -1186,6 +1243,195 @@ function shimNameFromBin(binName: string): string {
   return basename(binName).replace(/\.exe$/i, "");
 }
 
+function rustcBuildApprovalError(appName: string, infoObj: ScoopixApp, requestedApp?: string): Error {
+  const packageLabel = requestedApp ?? appName;
+  const source = infoObj.git ? `${infoObj.git}${infoObj.ref ? `#${infoObj.ref}` : ""}${infoObj.path ? `:${infoObj.path}` : ""}` : infoObj.url ?? "<missing source URL>";
+  return new Error([
+    `refusing to compile downloaded Rust source for '${packageLabel}' without --approve-rustc-build.`,
+    `Source: ${source}`,
+    "Risk: rustc will turn this source into a native executable that runs with your user permissions.",
+    "Inspect: review the source URL and the bucket manifest entry before approving.",
+    `Approve: rerun the same command with --approve-rustc-build, for example: scoopix install ${packageLabel} --approve-rustc-build`,
+  ].join("\n"));
+}
+
+function safeVersionPart(value: string): string {
+  return value.replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "") || "unknown";
+}
+
+async function gitOutput(args: string[], cwd?: string): Promise<string> {
+  const gitPath = await commandPath("git");
+  if (!gitPath) throw new Error("git not found on PATH; git-backed source installs require git");
+  const result = await new Deno.Command(gitPath, { args, cwd, stdout: "piped", stderr: "piped" }).output();
+  if (!result.success) {
+    const stderr = new TextDecoder().decode(result.stderr).trim();
+    throw new Error(`git ${args.join(" ")} failed: ${stderr}`);
+  }
+  return new TextDecoder().decode(result.stdout).trim();
+}
+
+async function prepareGitSource(appName: string, declaredVersion: string, infoObj: ScoopixApp, opts: any) {
+  if (!infoObj.git) return null;
+  const ref = infoObj.ref ?? "HEAD";
+  const repoDir = await ensureGitRepo(infoObj.git, ref, opts);
+  const requestedSha = gitShaFromDerivedVersion(opts.version ?? opts.requestedVersion ?? "");
+  await gitOutput(["checkout", "--detach", requestedSha ?? "FETCH_HEAD"], repoDir);
+  const fullSha = await gitOutput(["rev-parse", "HEAD"], repoDir);
+  const shortSha = await gitOutput(["rev-parse", "--short=7", "HEAD"], repoDir);
+  const count = await gitOutput(["rev-list", "--count", "HEAD"], repoDir);
+  const date = await gitOutput(["show", "-s", "--format=%cd", "--date=format:%Y%m%d", "HEAD"], repoDir);
+  const isoDate = await gitOutput(["show", "-s", "--format=%cI", "HEAD"], repoDir);
+  const subject = await gitOutput(["show", "-s", "--format=%s", "HEAD"], repoDir);
+  const authorName = await gitOutput(["show", "-s", "--format=%an", "HEAD"], repoDir);
+  const authorEmail = await gitOutput(["show", "-s", "--format=%ae", "HEAD"], repoDir);
+  const committerName = await gitOutput(["show", "-s", "--format=%cn", "HEAD"], repoDir);
+  const committerEmail = await gitOutput(["show", "-s", "--format=%ce", "HEAD"], repoDir);
+  const signatureStatus = await gitOutput(["show", "-s", "--format=%G?", "HEAD"], repoDir).catch(() => "unknown");
+  const signatureKey = await gitOutput(["show", "-s", "--format=%GK", "HEAD"], repoDir).catch(() => "");
+  const safeRef = safeVersionPart(ref.replace(/^refs\/heads\//, "").replace(/^origin\//, ""));
+  const version = `${declaredVersion}-${date}.${count}.${safeRef}.g${shortSha}`;
+  return {
+    sourcePath: join(repoDir, infoObj.path ?? `${appName}.rs`),
+    version,
+    git: { ref, fullSha, shortSha, count, date, isoDate, subject, authorName, authorEmail, committerName, committerEmail, signatureStatus, signatureKey },
+  };
+}
+
+async function ensureGitRepo(gitUrl: string, ref: string, opts: any = {}) {
+  const repoDir = join(CACHE_DIR, "git", safeStateName(gitUrl));
+  await ensureDir(dirname(repoDir));
+  if (opts.ignoreDownloadCache || !(await exists(join(repoDir, ".git")))) {
+    await Deno.remove(repoDir, { recursive: true }).catch(() => {});
+    await gitOutput(["clone", gitUrl, repoDir]);
+  }
+  await gitOutput(["fetch", "origin", ref], repoDir);
+  await gitOutput(["checkout", "--detach", "FETCH_HEAD"], repoDir);
+  return repoDir;
+}
+
+function gitShaFromDerivedVersion(version: string): string | null {
+  return version.match(/\.g([0-9a-f]{7,40})$/i)?.[1] ?? null;
+}
+
+function gitDerivedVersion(declaredVersion: string, date: string, count: string, ref: string, shortSha: string): string {
+  return `${declaredVersion}-${date}.${count}.${safeVersionPart(ref)}.g${shortSha}`;
+}
+
+async function discoverGitFileVersions(appName: string, infoObj: ScoopixApp, source?: ScoopixVersionSource): Promise<string[]> {
+  if (!infoObj.git) return [];
+  const ref = source?.ref ?? infoObj.ref ?? "HEAD";
+  const filePath = source?.path ?? infoObj.path ?? `${appName}.rs`;
+  const repoDir = await ensureGitRepo(infoObj.git, ref);
+  const safeRef = safeVersionPart(ref.replace(/^refs\/heads\//, "").replace(/^origin\//, ""));
+  const log = await gitOutput([
+    "log",
+    "--follow",
+    "--max-count=20",
+    "--date=format:%Y%m%d",
+    "--format=%H%x09%h%x09%cd",
+    "--",
+    filePath,
+  ], repoDir);
+  const versions: string[] = [];
+  for (const line of log.split(/\r?\n/).filter(Boolean)) {
+    const [fullSha, shortSha, date] = line.split("\t");
+    if (!fullSha || !shortSha || !date) continue;
+    const count = await gitOutput(["rev-list", "--count", fullSha], repoDir);
+    versions.push(gitDerivedVersion(infoObj.version, date, count, safeRef, shortSha));
+  }
+  return versions;
+}
+
+async function buildSourcePlaceholders(appName: string, version: string, infoObj: ScoopixApp, gitMeta: any = {}) {
+  const user = Deno.env.get("USER") ?? Deno.env.get("USERNAME") ?? "unknown";
+  const hostname = await captureCommand(Deno.build.os === "windows" ? "hostname" : "hostname");
+  return {
+    ...infoObj,
+    ...(infoObj.vars ?? {}),
+    app: appName,
+    version,
+    declaredVersion: infoObj.version,
+    buildUser: user,
+    buildHost: hostname.code === 0 ? hostname.stdout.trim() : "unknown",
+    buildTime: new Date().toISOString(),
+    git: gitMeta,
+  };
+}
+
+async function applySourceReplacements(sourcePath: string, appName: string, version: string, infoObj: ScoopixApp, gitMeta: any) {
+  if (!infoObj.sourceReplacements?.length) return sourcePath;
+  let text = await Deno.readTextFile(sourcePath);
+  const placeholders = await buildSourcePlaceholders(appName, version, infoObj, gitMeta);
+  for (const entry of infoObj.sourceReplacements) {
+    text = text.replace(new RegExp(entry.pattern, "g"), expandPlaceholders(entry.replacement, placeholders));
+  }
+  const buildSource = join(TEMP_DIR, appName, `${safeStateName(appName)}.rs`);
+  await ensureDir(dirname(buildSource));
+  await Deno.writeTextFile(buildSource, text);
+  return buildSource;
+}
+
+async function buildRustWithLocalRustc(appName: string, version: string, infoObj: ScoopixApp, dest: string, opts: any) {
+  if (!opts.approveRustcBuild) {
+    throw rustcBuildApprovalError(appName, infoObj, opts.requestedApp);
+  }
+  if (!infoObj.url && !opts.sourcePath) throw new Error(`Rust package '${appName}' requires a source URL or git source`);
+  const rustcPath = await commandPath("rustc");
+  if (!rustcPath) {
+    throw new Error(
+      `rustc not found on PATH. Install Rust locally and rerun with --approve-rustc-build; Docker fallback will be a separate --approve-docker-build path.`,
+    );
+  }
+
+  await ensureDir(CACHE_DIR);
+  let sourcePath = opts.sourcePath as string | undefined;
+  if (!sourcePath) {
+    sourcePath = join(CACHE_DIR, `${appName}#${version}.rs`);
+    if (opts.ignoreDownloadCache || !(await exists(sourcePath))) {
+      const resp = await fetch(infoObj.url!);
+      if (!resp.ok) throw new Error(`Failed to download Rust source: ${resp.status} ${resp.statusText}`);
+      const file = await Deno.open(sourcePath, { write: true, create: true, truncate: true });
+      await resp.body?.pipeTo(file.writable);
+    } else {
+      info(`buildRustWithLocalRustc: using cached source ${sourcePath}`);
+    }
+  }
+  sourcePath = await applySourceReplacements(sourcePath, appName, version, infoObj, opts.git ?? {});
+
+  await ensureDir(dirname(dest));
+  const crateName = safeStateName(appName).replace(/^[^A-Za-z_]/, "_").replace(/[^A-Za-z0-9_]/g, "_");
+  const args = [sourcePath, "--crate-name", crateName, "-O", ...(infoObj.rustc?.args ?? []), "-o", dest];
+  await runCommandWithLogs(rustcPath, args, `rustc build for '${appName}'`, Deno.cwd(), { briefFailure: true });
+  await Deno.chmod(dest, 0o755).catch(() => {});
+  const rustcVersion = await captureCommand(rustcPath, ["--version"]);
+  const buildInfo = await buildSourcePlaceholders(appName, version, infoObj, opts.git ?? {});
+  return {
+    sourceType: opts.git ? "git" : "url",
+    url: infoObj.url,
+    git: infoObj.git,
+    ref: infoObj.ref,
+    path: infoObj.path,
+    commit: opts.git?.fullSha,
+    shortCommit: opts.git?.shortSha,
+    commitCount: opts.git?.count,
+    commitDate: opts.git?.isoDate,
+    authorName: opts.git?.authorName,
+    authorEmail: opts.git?.authorEmail,
+    committerName: opts.git?.committerName,
+    committerEmail: opts.git?.committerEmail,
+    subject: opts.git?.subject,
+    signatureStatus: opts.git?.signatureStatus,
+    signatureKey: opts.git?.signatureKey,
+    derivedVersion: version,
+    buildTime: buildInfo.buildTime,
+    buildUser: buildInfo.buildUser,
+    buildHost: buildInfo.buildHost,
+    builder: "rustc",
+    rustc: rustcVersion.code === 0 ? rustcVersion.stdout.trim() : rustcPath,
+    rustcArgs: args,
+  };
+}
+
 async function installFromDelegated(infoObj: ScoopixApp, appName: string) {
   info(`installApp: delegated install (commands) for '${appName}'`);
   const workDir = join(TEMP_DIR, appName);
@@ -1236,6 +1482,7 @@ async function linkAppBinaries(
   version: string,
   binName: string,
   shimName = appName,
+  provenance?: Record<string, unknown>,
 ) {
   const currentLink = join(APPS_DIR, appName, "current");
   const versionDir = join(APPS_DIR, appName, version);
@@ -1252,7 +1499,7 @@ async function linkAppBinaries(
     await Deno.remove(binPath);
   } catch {}
   await Deno.symlink(shimTarget, binPath, { type: "file" });
-  await writeAppState(appName, packageId, version);
+  await writeAppState(appName, packageId, version, provenance);
   await writeShimState(shimName, packageId, version, shimTarget);
 
   console.log(`Installed '${packageId}:${version}' -> ${binPath}`);
@@ -1303,7 +1550,7 @@ async function installApp(app: string, opts: any = {}) {
   let version = installOpts.resolvedVersion ?? resolved.version;
   let infoObj = installOpts.resolvedInfo ?? resolved.info;
 
-  if (requestedVersion && !installOpts.resolvedVersion && !installOpts.resolvedInfo) {
+  if (requestedVersion && !installOpts.resolvedVersion && !installOpts.resolvedInfo && !(resolved.info.type === "src" && resolved.info.rustc && resolved.info.git)) {
     const appId = `${bucket}/${appName}`;
     const versions = await discoverVersions(appId, resolved.info);
     if (!versions.includes(requestedVersion)) {
@@ -1339,6 +1586,18 @@ async function installApp(app: string, opts: any = {}) {
     await installArtifact(appName, version, infoObj as any, installOpts);
     info(`installApp: completed artifact build of '${appName}'`);
     return;
+  }
+
+  if (infoObj.type === "src" && infoObj.rustc && !installOpts.approveRustcBuild) {
+    throw rustcBuildApprovalError(appName, infoObj, installOpts.requestedApp);
+  }
+
+  const gitSource = infoObj.type === "src" && infoObj.rustc ? await prepareGitSource(appName, version, infoObj, installOpts) : null;
+  if (gitSource) {
+    version = gitSource.version;
+    infoObj = { ...infoObj, version };
+    installOpts.sourcePath = gitSource.sourcePath;
+    installOpts.git = gitSource.git;
   }
 
   const binNames = appBinNames(infoObj.bin, appName);
@@ -1383,17 +1642,22 @@ async function installApp(app: string, opts: any = {}) {
     return;
   }
 
+  let provenance: Record<string, unknown> | undefined;
   if (infoObj.commands) {
     await installFromDelegated(infoObj, appName);
   } else if (infoObj.type === "src") {
     info(`installApp: source build requested for '${appName}'`);
-    await buildFromSource(appName, infoObj as any, dest, opts);
+    if (infoObj.rustc) {
+      provenance = await buildRustWithLocalRustc(appName, version, infoObj, dest, installOpts);
+    } else {
+      await buildFromSource(appName, infoObj as any, dest, opts);
+    }
   } else {
     await installFromBinary(infoObj, dest, { ...opts, appName, version, installRoot: appDir });
   }
 
   for (const [index, candidate] of binNames.entries()) {
-    await linkAppBinaries(packageId, appName, version, candidate, index === 0 ? shimName : shimNameFromBin(candidate));
+    await linkAppBinaries(packageId, appName, version, candidate, index === 0 ? shimName : shimNameFromBin(candidate), provenance);
   }
   if (!installOpts.suppressOutput) {
     await postInstallVerify(packageId, appName, version, infoObj, binName, shimName);
@@ -1475,7 +1739,7 @@ async function readAppState(appName: string): Promise<AppState | null> {
   }
 }
 
-async function writeAppState(appName: string, owner: string, version: string) {
+async function writeAppState(appName: string, owner: string, version: string, provenance?: Record<string, unknown>) {
   await ensureDir(APPS_STATE_DIR);
   await Deno.writeTextFile(
     appStatePath(appName),
@@ -1484,6 +1748,7 @@ async function writeAppState(appName: string, owner: string, version: string) {
         name: appName,
         owner,
         version,
+        ...(provenance ? { provenance } : {}),
         updatedAt: new Date().toISOString(),
       },
       null,
@@ -3363,6 +3628,7 @@ await new Command()
   .option("--ignore-build-cache", "Force rebuild from source, ignoring cached Docker image")
   .option("--ignore-download-cache", "Force re-download even if cached")
   .option("--force-artifact-build", "Force rebuilding artifact outputs even if cached")
+  .option("--approve-rustc-build", "Allow compiling downloaded Rust source with local rustc")
   .option("--aria2", "Use aria2c for HTTP(S) downloads instead of the built-in downloader")
   .option("--keep-temp", "Keep extracted files in ~/.scoopix/temp/<app>")
   .option("--system", "Run system install commands after building, requires root")
@@ -3384,6 +3650,7 @@ await new Command()
           ignoreBuildCache: opts.force || opts.ignoreBuildCache,
           ignoreDownloadCache: opts.force || opts.ignoreDownloadCache,
           forceArtifactBuild: opts.force || opts.forceArtifactBuild,
+          approveRustcBuild: opts.approveRustcBuild,
           version: opts.version,
           aria2: opts.aria2,
           keepTemp: opts.keepTemp,
@@ -3418,6 +3685,7 @@ await new Command()
   .option("--ignore-build-cache", "Force rebuild from source, ignoring cached Docker image")
   .option("--ignore-download-cache", "Force re-download even if cached")
   .option("--force-artifact-build", "Force rebuilding artifact outputs even if cached")
+  .option("--approve-rustc-build", "Allow compiling downloaded Rust source with local rustc")
   .option("--keep-temp", "Keep extracted files in ~/.scoopix/temp/<app>")
   .option("--system", "Run system install commands after building, requires root")
   .action(async (opts, app) => {
@@ -3435,6 +3703,7 @@ await new Command()
         ignoreBuildCache: opts.ignoreBuildCache,
         ignoreDownloadCache: opts.ignoreDownloadCache,
         forceArtifactBuild: opts.forceArtifactBuild,
+        approveRustcBuild: opts.approveRustcBuild,
         keepTemp: opts.keepTemp,
         system: opts.system,
         version: opts.version,
@@ -3548,6 +3817,16 @@ await new Command()
   .option("--full", "Show full bucket path")
   .action(async (cliOpts) => {
     await listApps(cliOpts.full ?? false, true);
+  })
+  .command("info <app:string>", "Show installed app provenance and build information")
+  .action(async (_opts, app) => {
+    try {
+      await printAppInfo(app);
+    } catch (err) {
+      error(`Info failed: ${app}`);
+      console.error(`Reason: ${err instanceof Error ? err.message : String(err)}`);
+      Deno.exit(1);
+    }
   })
   .command("versions <app:string>", "List installed, saved, bucket, and source versions for an app")
   .action(async (_opts, app) => {

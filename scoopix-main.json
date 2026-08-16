@@ -139,6 +139,47 @@
       }
     }
   },
+  "rtee": {
+    "version": "0.1.0",
+    "description": "Run a command while teeing stdin/stdout/stderr to a structured markdown log",
+    "homepage": "https://github.com/raisercostin/scripts/blob/main/rtee.rs",
+    "license": "MIT",
+    "type": "src",
+    "git": "https://github.com/raisercostin/scripts.git",
+    "ref": "main",
+    "path": "rtee.rs",
+    "versionSource": {
+      "type": "git-log",
+      "ref": "main",
+      "path": "rtee.rs"
+    },
+    "rustc": {},
+    "sourceReplacements": [
+      {
+        "pattern": "const VERSION: &str = \"[^\"]*\";",
+        "replacement": "const VERSION: &str = \"{version}\";"
+      }
+    ],
+    "healthcheck": {
+      "command": "{target}",
+      "args": ["--version"],
+      "match": "rtee {version}"
+    },
+    "arch": {
+      "windows-x86_64": {
+        "bin": "rtee.exe"
+      },
+      "x86_64": {
+        "bin": "rtee"
+      },
+      "aarch64": {
+        "bin": "rtee"
+      },
+      "armv7": {
+        "bin": "rtee"
+      }
+    }
+  },
   "bcat": {
     "version": "0.6.2",
     "type": "src",
