@@ -664,7 +664,7 @@ async function discoverVersionsFromSource(source: ScoopixVersionSource): Promise
 
 async function discoverVersions(appId: string, infoObj: ScoopixApp): Promise<string[]> {
   const versionSource = infoObj.versionSource;
-  if (!versionSource && infoObj.git && infoObj.path) {
+  if (!versionSource && sourceGitInfo(infoObj)) {
     return uniqueSortedVersions(await discoverGitFileVersions(appId.split("/").pop() ?? appId, infoObj));
   }
   if (!versionSource) {
@@ -1245,7 +1245,8 @@ function shimNameFromBin(binName: string): string {
 
 function rustcBuildApprovalError(appName: string, infoObj: ScoopixApp, requestedApp?: string): Error {
   const packageLabel = requestedApp ?? appName;
-  const source = infoObj.git ? `${infoObj.git}${infoObj.ref ? `#${infoObj.ref}` : ""}${infoObj.path ? `:${infoObj.path}` : ""}` : infoObj.url ?? "<missing source URL>";
+  const sourceInfo = sourceGitInfo(infoObj);
+  const source = sourceInfo ? `${sourceInfo.git}#${sourceInfo.ref}:${sourceInfo.path}` : infoObj.url ?? "<missing source URL>";
   return new Error([
     `refusing to compile downloaded Rust source for '${packageLabel}' without --approve-rustc-build.`,
     `Source: ${source}`,
@@ -1257,6 +1258,32 @@ function rustcBuildApprovalError(appName: string, infoObj: ScoopixApp, requested
 
 function safeVersionPart(value: string): string {
   return value.replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "") || "unknown";
+}
+
+function githubBlobSource(url: string | undefined): { git: string; ref: string; path: string } | null {
+  if (!url) return null;
+  const match = url.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)\/(.+)$/);
+  if (!match) return null;
+  const [, owner, repo, ref, path] = match;
+  return { git: `https://github.com/${owner}/${repo}.git`, ref, path };
+}
+
+function gitUrlSource(url: string | undefined): { git: string; ref: string; path: string } | null {
+  if (!url?.startsWith("git+")) return null;
+  const spec = url.slice("git+".length);
+  const match = spec.match(/^(.+)#([^:]+):(.+)$/);
+  if (!match) return null;
+  const [, git, ref, path] = match;
+  return { git, ref, path };
+}
+
+function sourceGitInfo(infoObj: ScoopixApp): { git: string; ref: string; path: string } | null {
+  const explicitUrl = gitUrlSource(infoObj.url);
+  const blob = githubBlobSource(infoObj.url);
+  const git = infoObj.git ?? explicitUrl?.git ?? blob?.git;
+  const ref = infoObj.ref ?? explicitUrl?.ref ?? blob?.ref;
+  const path = infoObj.path ?? explicitUrl?.path ?? blob?.path;
+  return git && ref && path ? { git, ref, path } : null;
 }
 
 async function gitOutput(args: string[], cwd?: string): Promise<string> {
@@ -1271,9 +1298,10 @@ async function gitOutput(args: string[], cwd?: string): Promise<string> {
 }
 
 async function prepareGitSource(appName: string, declaredVersion: string, infoObj: ScoopixApp, opts: any) {
-  if (!infoObj.git) return null;
-  const ref = infoObj.ref ?? "HEAD";
-  const repoDir = await ensureGitRepo(infoObj.git, ref, opts);
+  const sourceInfo = sourceGitInfo(infoObj);
+  if (!sourceInfo) return null;
+  const { git, ref, path } = sourceInfo;
+  const repoDir = await ensureGitRepo(git, ref, opts);
   const requestedSha = gitShaFromDerivedVersion(opts.version ?? opts.requestedVersion ?? "");
   await gitOutput(["checkout", "--detach", requestedSha ?? "FETCH_HEAD"], repoDir);
   const fullSha = await gitOutput(["rev-parse", "HEAD"], repoDir);
@@ -1291,7 +1319,7 @@ async function prepareGitSource(appName: string, declaredVersion: string, infoOb
   const safeRef = safeVersionPart(ref.replace(/^refs\/heads\//, "").replace(/^origin\//, ""));
   const version = `${declaredVersion}-${date}.${count}.${safeRef}.g${shortSha}`;
   return {
-    sourcePath: join(repoDir, infoObj.path ?? `${appName}.rs`),
+    sourcePath: join(repoDir, path),
     version,
     git: { ref, fullSha, shortSha, count, date, isoDate, subject, authorName, authorEmail, committerName, committerEmail, signatureStatus, signatureKey },
   };
@@ -1318,10 +1346,11 @@ function gitDerivedVersion(declaredVersion: string, date: string, count: string,
 }
 
 async function discoverGitFileVersions(appName: string, infoObj: ScoopixApp, source?: ScoopixVersionSource): Promise<string[]> {
-  if (!infoObj.git) return [];
-  const ref = source?.ref ?? infoObj.ref ?? "HEAD";
-  const filePath = source?.path ?? infoObj.path ?? `${appName}.rs`;
-  const repoDir = await ensureGitRepo(infoObj.git, ref);
+  const sourceInfo = sourceGitInfo(infoObj);
+  if (!sourceInfo) return [];
+  const ref = source?.ref ?? sourceInfo.ref;
+  const filePath = source?.path ?? sourceInfo.path ?? `${appName}.rs`;
+  const repoDir = await ensureGitRepo(sourceInfo.git, ref);
   const safeRef = safeVersionPart(ref.replace(/^refs\/heads\//, "").replace(/^origin\//, ""));
   const log = await gitOutput([
     "log",
@@ -1405,12 +1434,13 @@ async function buildRustWithLocalRustc(appName: string, version: string, infoObj
   await Deno.chmod(dest, 0o755).catch(() => {});
   const rustcVersion = await captureCommand(rustcPath, ["--version"]);
   const buildInfo = await buildSourcePlaceholders(appName, version, infoObj, opts.git ?? {});
+  const sourceInfo = sourceGitInfo(infoObj);
   return {
     sourceType: opts.git ? "git" : "url",
     url: infoObj.url,
-    git: infoObj.git,
-    ref: infoObj.ref,
-    path: infoObj.path,
+    git: sourceInfo?.git,
+    ref: sourceInfo?.ref,
+    path: sourceInfo?.path,
     commit: opts.git?.fullSha,
     shortCommit: opts.git?.shortSha,
     commitCount: opts.git?.count,

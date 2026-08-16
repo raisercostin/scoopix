@@ -142,16 +142,12 @@
   "rtee": {
     "version": "0.1.0",
     "description": "Run a command while teeing stdin/stdout/stderr to a structured markdown log",
-    "homepage": "https://github.com/raisercostin/scripts/blob/main/rtee.rs",
+    "homepage": "https://github.com/raisercostin/scripts/blob/main/rtee.md",
     "license": "MIT",
     "type": "src",
-    "git": "https://github.com/raisercostin/scripts.git",
-    "ref": "main",
-    "path": "rtee.rs",
+    "url": "https://github.com/raisercostin/scripts/blob/main/rtee.rs",
     "versionSource": {
-      "type": "git-log",
-      "ref": "main",
-      "path": "rtee.rs"
+      "type": "git-log"
     },
     "rustc": {},
     "sourceReplacements": [
