@@ -2012,6 +2012,24 @@ async function ownedShimStates(owner: string): Promise<ShimState[]> {
   return states;
 }
 
+async function shimStatesForAppName(appName: string): Promise<ShimState[]> {
+  const states: ShimState[] = [];
+  try {
+    for await (const entry of Deno.readDir(SHIMS_STATE_DIR)) {
+      if (!entry.isFile || !entry.name.endsWith(".json")) continue;
+      try {
+        const state = JSON.parse(await Deno.readTextFile(join(SHIMS_STATE_DIR, entry.name))) as ShimState;
+        if (state.owner.split("/").pop() === appName) states.push(state);
+      } catch {
+        warn(`Ignoring unreadable shim state '${entry.name}'.`);
+      }
+    }
+  } catch {
+    return [];
+  }
+  return states;
+}
+
 async function writeShimState(shimName: string, owner: string, version: string, target: string) {
   await ensureDir(SHIMS_STATE_DIR);
   await Deno.writeTextFile(
@@ -2079,7 +2097,13 @@ async function removeOwnedShim(candidate: string, requestedOwner: string | null)
     warn(`Skipping '${candidate}'; owned by ${state.owner}.`);
     return false;
   }
-  if (!(await removeIfPresent(candidate))) return false;
+  if (!(await removeIfPresent(candidate))) {
+    if (state && (!requestedOwner || state.owner === requestedOwner)) {
+      await removeShimState(shimName);
+      return true;
+    }
+    return false;
+  }
   if (!state || !requestedOwner || state.owner === requestedOwner) {
     await removeShimState(shimName);
   }
@@ -2098,7 +2122,8 @@ async function uninstallApp(app: string, opts: { all?: boolean } = {}) {
   const appSpec = parsed.app;
   const appName = appSpec.includes("/") ? appSpec.split("/").pop()! : appSpec;
   const found = await findApp(appSpec, { allowInstalledOwnerStub: true });
-  const owner = found ? `${found.bucket}/${appName}` : null;
+  const staleShimStates = found ? [] : await shimStatesForAppName(appName);
+  const owner = found ? `${found.bucket}/${appName}` : staleShimStates.length === 1 ? staleShimStates[0].owner : null;
   const shimName = found?.info?.shim ?? appName;
   const versions = await installedVersions(appName);
   const current = await installedVersion(appName);
@@ -2108,7 +2133,9 @@ async function uninstallApp(app: string, opts: { all?: boolean } = {}) {
     );
   }
 
-  const ownedShimCandidates = owner ? (await ownedShimStates(owner)).map((state) => join(BIN_DIR, state.name)) : [];
+  const ownedShimCandidates = owner
+    ? (await ownedShimStates(owner)).map((state) => join(BIN_DIR, state.name))
+    : staleShimStates.map((state) => join(BIN_DIR, state.name));
   const candidates = [
     ...new Set([
       ...ownedShimCandidates,
@@ -3653,6 +3680,13 @@ async function runAutotest(test = "all") {
       await uninstallApp("same", { all: true });
       if (await readShimState("x-same")) {
         throw new Error("uninstall should remove recorded prefixed shim state for x-same");
+      }
+
+      status("autotest: uninstall removes stale shim state after app directory is gone");
+      await writeShimState("orphaned-same", "local/orphaned-same", "1.0", join(APPS_DIR, "orphaned-same", "current", "bin", "orphaned-same"));
+      await uninstallApp("orphaned-same");
+      if (await readShimState("orphaned-same")) {
+        throw new Error("uninstall should remove stale shim state when the target path is already gone");
       }
     };
 
