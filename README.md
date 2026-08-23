@@ -9,6 +9,8 @@ Scoopix has evolved from "Scoop for Synology/Linux" into a more general installe
 - It can install downloaded binaries, extracted application trees, source-built binaries, delegated recipes, system-assisted packages, and metadata-like packages such as shell configuration or future completion targets.
 - It separates package identity from upstream version discovery. A manifest can pin a known-good bucket version while `versionsFinder` discovers newer or older upstream versions on demand.
 - It supports exact version installs with `app@version` and `--version`, force reinstalls, cached downloads, and local bucket manifest updates when you intentionally want to persist a resolved version.
+- It supports direct installs from local single-file Rust sources such as `./sudo.rs` without requiring a bucket entry.
+- It separates package identity from command names with `--name`, `--as`, and `--shim-prefix` for collision-safe installs.
 - It treats buckets as editable infrastructure. A local bucket can be a project file, a Git repo, or a remote raw JSON file; Scoopix can use the loaded bucket, source discovery, and local Git history as separate version lanes.
 - It is intentionally user-local by default, but can run selected system operations when a package explicitly needs them, such as Synology WireGuard installation.
 
@@ -23,12 +25,14 @@ Longer-term, Scoopix should move toward URL-first packages with conventions. A p
 - **Cross-platform** – runs on Linux, WSL2, Synology DSM, Entware, and more.
 - **Version lanes** – installed, saved, bucket, source-discovered, and git-backed bucket history can be inspected separately.
 - **Exact versions** – install or upgrade with `bucket/app@version` or `--version` when a manifest has `versionsFinder`.
+- **Direct source installs** – install a local single-file Rust source directly with `scoopix install ./tool.rs`.
 - **Source builds via Docker** – if no binary is available, Scoopix can build from source inside a Docker container.
 - **Artifact-shaped installs** – packages can preserve extracted trees and expose several command shims from one archive.
 - **Synology WireGuard from source** – one command can build the `wg` userspace tool and a Synology WireGuard kernel-module SPK instead of relying on an opaque third-party package.
 - **Architecture awareness** – manifests can provide `x86_64`, `aarch64`, `armv7` variants.
 - **Cache support** – downloads and Docker builds are cached; can be bypassed with `--ignore-download-cache`, `--ignore-build-cache`, or `--force`.
 - **Shims directory (`~/.scoopix/bin`)** – holds app command shims, just like Scoop’s `shims`.
+- **Command aliases** – install one package under a different command name with `--as`, or namespace all shims with `--shim-prefix`.
 - **Man page support** – installs `man` pages into `~/.scoopix/share/man`.
 
 ## Install / Dev Usage
@@ -155,6 +159,45 @@ Run it:
 ```bash
 micro
 ```
+
+### Avoid command-name collisions
+
+Use `--as` when a package command would collide with an existing utility. On Windows, if the package binary is `.exe`, Scoopix keeps the installed shim executable-friendly, so this installs `sudo2.exe` and `sudo2` works from Git Bash:
+
+```bash
+scoopix install main/sudo --as sudo2 --approve-rustc-build
+sudo2 --help
+```
+
+Use `--shim-prefix` when a package exposes several commands and you want all shims namespaced:
+
+```bash
+scoopix install main/arangodb --shim-prefix arango-
+```
+
+After uninstalling a command, Bash can keep a stale command-path cache for the current terminal. If it still tries a removed `~/.scoopix/bin/...` path, run:
+
+```bash
+hash -r
+```
+
+### Direct Local Rust Installs
+
+Install a local single-file Rust program directly, without adding it to a bucket:
+
+```bash
+scoopix install ../scripts/sudo.rs --approve-rustc-build
+sudo --version
+```
+
+For generic file names or development variants, use `--name` to set the package identity and `--as` to set the command exposed on `PATH`:
+
+```bash
+scoopix install ../scripts/sudo.rs --name sudo-dev --as sudo2 --approve-rustc-build
+sudo2 --version
+```
+
+Direct local Rust installs are normal installs. Scoopix copies the current source bytes into `~/.scoopix/cache/direct-sources`, derives the installed version from the source-declared version plus a source hash, builds that cached copy, and leaves previous versions under `~/.scoopix/apps/<name>/<version>`. Future live installs are planned separately for source paths that should rebuild automatically when the file changes.
 
 ### Upgrade and version selection
 
@@ -323,11 +366,14 @@ Practical policy: keep `~/.scoopix` as the default portable root, consider XDG a
 Working now:
 
 * `install` creates versioned app installs, a stable `current` link, and command shims in `~/.scoopix/bin`.
+* `install --as <name>` can expose the primary command under a different shim name, and `--shim-prefix <prefix>` can namespace every shim from multi-command packages.
+* `uninstall` removes recorded Scoopix-owned shims, including aliased or prefixed shims, and reminds Bash users to run `hash -r` when a shell command cache points at a removed shim.
 * `config path` configures both shell startup files and, on Windows, the Windows user `PATH`; `--remove` reverses only Scoopix PATH entries.
 * `versionsFinder` discovers installable versions from GitHub releases, web indexes, multiple web regex sources, and Git file history.
 * `upgrade micro` follows the installed owner bucket and can upgrade from upstream `versionsFinder`.
 * `srcVersionDetector` can extract a formal source version and inject the derived build version into friendly source builds.
 * `install main/rtee --approve-rustc-build` compiles a Git-backed single-file Rust source with local `rustc`, stores provenance, and installs the generated executable.
+* `install ./tool.rs --approve-rustc-build` performs a direct local Rust source install without a bucket entry, caches the exact source bytes, derives a hash-based install version, and stores local source provenance.
 * `info <app>` shows installed provenance such as Git commit, author, committer, signature status, builder, build time, user, and host when available.
 * Archive installs can preserve extracted application trees and expose multiple shims, used by the Windows ArangoDB package.
 * Manifest `healthcheck` can verify the installed target after install or upgrade.
@@ -336,7 +382,8 @@ Remaining work:
 
 * Add a Scoop-style Windows `.exe` shim launcher plus `.shim` metadata for sidecar DLL, cwd, env, and argument handling.
 * Add Docker-backed Rust/source builds behind an explicit `--approve-docker-build` trust gate.
-* Add direct URL installs for metadata-light single-file sources after manifest installs are solid.
+* Add direct HTTP/Git URL installs for metadata-light single-file sources after direct local installs are solid.
+* Add live source installs that follow a source path or URL and rebuild/delegate when the source changes.
 * Add persisted approval records keyed by source URL, version, commit/hash, and build strategy.
 * Add non-mutating/dry-run output for PATH configuration and removal.
 * Expand automated tests around PATH config strategies and Windows registry updates.
@@ -347,7 +394,8 @@ Remaining work:
 * [ ] Add hash checking support (like Scoop).
 * [ ] Add signature/checksum display in `info` for binary and source installs.
 * [ ] Add `--approve-docker-build` and Docker fallback for Rust/source installs.
-* [ ] Add direct `scoopix install <url>` for simple Git/blob source URLs.
+* [ ] Add direct `scoopix install <url>` for simple HTTP/Git/blob source URLs.
+* [ ] Add `scoopix install --live <source>` for live Rust, TypeScript/Deno, Java/JBang, Nu, and similar script/source workflows.
 * [ ] Explore URL-first package conventions so buckets can shrink to catalogs/overrides when upstream carries enough metadata.
 * [ ] Distributed buckets (community buckets).
 * [ ] Tests and CI integration.

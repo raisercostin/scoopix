@@ -182,6 +182,32 @@
       }
     }
   },
+  "sudo": {
+    "version": "0.1.0",
+    "description": "Windows UAC elevation helper implemented as a native executable",
+    "homepage": "https://github.com/raisercostin/scripts/blob/main/sudo.md",
+    "license": "MIT",
+    "type": "src",
+    "url": "https://github.com/raisercostin/scripts/blob/main/sudo.rs",
+    "versionsFinder": {
+      "type": "git-log"
+    },
+    "srcVersionDetector": {
+      "type": "regex",
+      "pattern": "const VERSION: &str = \"([^\"]+)\";"
+    },
+    "rustc": {},
+    "healthcheck": {
+      "command": "{target}",
+      "args": ["--version"],
+      "match": "sudo {version}"
+    },
+    "arch": {
+      "windows-x86_64": {
+        "bin": "sudo.exe"
+      }
+    }
+  },
   "bcat": {
     "version": "0.6.2",
     "type": "src",

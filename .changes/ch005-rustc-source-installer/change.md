@@ -10,7 +10,7 @@ Add a manifest-based source installer path for single-file Rust programs. The fi
 - Select the local Rust compiler backend with a `rustc` manifest field.
 - Require `--approve-rustc-build` before compiling downloaded Rust source.
 - Do not implement Docker fallback yet; reserve that for a later `--approve-docker-build` path.
-- Keep direct URL Rust installs as future work after manifest-based installs are working.
+- Keep direct HTTP/Git URL Rust installs as future work after manifest-based and local-file installs are working.
 
 ## Rationale
 
@@ -26,12 +26,17 @@ Compiling a remote Rust file creates a native executable that runs with the user
 - Added derived Git install versions in the form `<declared-version>-<yyyymmdd>.<commit-count>.<ref>.g<short-sha>`.
 - Added source replacement support and `srcVersionDetector`, which extracts the formal source version and by default replaces that captured version with the derived build version before compilation.
 - Added installed app provenance metadata and `scoopix info <app>` for Git commit/build details.
+- Added direct local `.rs` installs, for example `scoopix install ./sudo.rs --approve-rustc-build`, which cache exact source bytes and derive a hash-based install version without requiring a bucket entry.
+- Added `install --as <name>` and `install --shim-prefix <prefix>` so packages can avoid command-name collisions while preserving package identity.
+- Updated uninstall to remove recorded Scoopix-owned shim state, including aliased and prefixed shims, and to suggest `hash -r` for stale Bash command caches.
 - Added `main/rtee`, sourced from `https://github.com/raisercostin/scripts/blob/main/rtee.rs` with homepage `https://github.com/raisercostin/scripts/blob/main/rtee.md`.
+- Added `main/sudo`, a Windows-only native Rust UAC elevation helper that installs as `sudo.exe`.
 
 ## Future Work
 
 - Add Docker Rust builds behind a separate `--approve-docker-build` approval.
-- Add a direct URL install path for metadata-free single-file sources.
+- Add a direct HTTP/Git URL install path for metadata-free single-file sources.
+- Add live source installs that follow Rust, TypeScript/Deno, Java/JBang, Nu, and similar source/script paths and rebuild or delegate when the source changes.
 - Consider persisted source/build approvals keyed by package URL, version, and hash.
 
 ## Resolution
@@ -45,3 +50,5 @@ Verified locally on Windows with an isolated `HOME`:
 - `scoopix versions main/rtee` lists the Git-log derived source version for commits that touched `rtee.rs`.
 - `scoopix install main/rtee --version 0.1.0-20260816.189.main.g73121a4 --approve-rustc-build --force` checks out that commit and builds it.
 - `scoopix info main/rtee` prints source URL, ref, path, full commit, commit date/count, author, committer, signature status, builder, rustc version, build time, and build user/host.
+- `scoopix install main/sudo --approve-rustc-build` builds `sudo.exe`, and `rtee sudo <command>` can spawn it as a native executable.
+- `scoopix install ./tool.rs --name direct-smoke --as direct-smoke-test --approve-rustc-build --no-autoconfig` builds a direct local Rust source install from a cached source copy and runs the generated command.

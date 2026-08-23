@@ -1,7 +1,7 @@
 #!/usr/bin/env -S deno run --allow-net --allow-read --allow-write --allow-env --allow-run
 import { ensureDir } from "https://deno.land/std@0.224.0/fs/ensure_dir.ts";
 import { exists } from "https://deno.land/std@0.224.0/fs/exists.ts";
-import { basename, dirname, isAbsolute, join, relative } from "https://deno.land/std@0.224.0/path/mod.ts";
+import { basename, dirname, extname, isAbsolute, join, relative } from "https://deno.land/std@0.224.0/path/mod.ts";
 import { Command } from "https://deno.land/x/cliffy@v1.0.0-rc.4/command/mod.ts";
 
 function passwdHome(user: string): string | null {
@@ -969,6 +969,9 @@ async function printAppInfo(app: string) {
   };
   print("source type", provenance.sourceType);
   print("source", provenance.git ?? provenance.url);
+  print("source file", provenance.sourceFile);
+  print("cached source", provenance.cachedSource);
+  print("source sha256", provenance.sourceSha256);
   print("ref", provenance.ref);
   print("path", provenance.path);
   print("commit", provenance.commit);
@@ -1176,7 +1179,11 @@ async function downloadAndInstall(
 }
 async function resolveAppInfo(
   app: string,
+  opts: any = {},
 ): Promise<{ appName: string; version: string; info: ScoopixApp; bucket: string }> {
+  const directSource = await directLocalRustSourceApp(app, opts);
+  if (directSource) return directSource;
+
   const found = await findApp(app);
   if (!found) {
     error(`installApp: app '${app}' not found`);
@@ -1218,6 +1225,36 @@ async function resolveAppInfo(
   return { appName, version, info: merged, bucket: found.bucket };
 }
 
+function appNameFromSourcePath(path: string): string {
+  const name = basename(path, extname(path));
+  return safeStateName(name).replace(/^[.-]+|[.-]+$/g, "") || "app";
+}
+
+async function directLocalRustSourceApp(
+  app: string,
+  opts: any = {},
+): Promise<{ appName: string; version: string; info: ScoopixApp; bucket: string } | null> {
+  if (/^https?:\/\//i.test(app) || !app.toLowerCase().endsWith(".rs")) return null;
+  const path = isAbsolute(app) ? app : join(Deno.cwd(), app);
+  if (!(await exists(path))) return null;
+  const appName = opts.name ?? appNameFromSourcePath(path);
+  const bin = Deno.build.os === "windows" ? `${appName}.exe` : appName;
+  return {
+    appName,
+    version: "0.0.0",
+    bucket: "local",
+    info: {
+      version: "0.0.0",
+      type: "src",
+      url: `file://${path}`,
+      bin,
+      rustc: {},
+      srcVersionDetector: { pattern: "const VERSION: &str = \\\"([^\\\"]+)\\\";" },
+      description: `Local Rust source ${path}`,
+    },
+  };
+}
+
 async function prepareAppDirectories(appName: string, version: string, binName: string) {
   const appDir = join(APPS_DIR, appName, version, "bin");
   await ensureDir(appDir);
@@ -1254,12 +1291,46 @@ function shimNameFromBin(binName: string): string {
   return Deno.build.os === "windows" ? name : name.replace(/\.exe$/i, "");
 }
 
+function assertSafeShimName(value: string, option: string) {
+  if (!value || value !== basename(value) || /[\\/:]/.test(value)) {
+    throw new Error(`${option} must be a command name, not a path: ${value}`);
+  }
+}
+
+function requestedShimName(value: string, binName: string): string {
+  assertSafeShimName(value, "--as");
+  return Deno.build.os === "windows" && /\.exe$/i.test(basename(binName)) && !/\.exe$/i.test(value) ? `${value}.exe` : value;
+}
+
+function resolveShimNames(
+  binNames: string[],
+  infoObj: ScoopixApp,
+  installOpts: { as?: string; shimPrefix?: string },
+  existingShims: ShimState[] = [],
+) {
+  const prefix = installOpts.shimPrefix ?? "";
+  if (prefix) assertSafeShimName(`${prefix}shim`, "--shim-prefix");
+  const keepExisting = !installOpts.as && !installOpts.shimPrefix;
+  return binNames.map((binName, index) => {
+    const existing = keepExisting
+      ? existingShims.find((state) => basename(state.target) === basename(binName))?.name
+      : undefined;
+    const baseName = index === 0
+      ? existing ?? (installOpts.as ? requestedShimName(installOpts.as, binName) : infoObj.shim ?? shimNameFromBin(binName))
+      : shimNameFromBin(binName);
+    const shimName = `${prefix}${baseName}`;
+    assertSafeShimName(shimName, index === 0 && installOpts.as ? "--as" : "--shim-prefix");
+    return shimName;
+  });
+}
+
 function rustcBuildApprovalError(appName: string, infoObj: ScoopixApp, requestedApp?: string): Error {
   const packageLabel = requestedApp ?? appName;
   const sourceInfo = sourceGitInfo(infoObj);
   const source = sourceInfo ? `${sourceInfo.git}#${sourceInfo.ref}:${sourceInfo.path}` : infoObj.url ?? "<missing source URL>";
+  const sourceKind = source.startsWith("file://") ? "local Rust source" : "downloaded Rust source";
   return new Error([
-    `refusing to compile downloaded Rust source for '${packageLabel}' without --approve-rustc-build.`,
+    `refusing to compile ${sourceKind} for '${packageLabel}' without --approve-rustc-build.`,
     `Source: ${source}`,
     "Risk: rustc will turn this source into a native executable that runs with your user permissions.",
     "Inspect: review the source URL and the bucket manifest entry before approving.",
@@ -1376,6 +1447,42 @@ async function formalSourceVersion(sourcePath: string, infoObj: ScoopixApp): Pro
   return version;
 }
 
+function hex(bytes: ArrayBuffer): string {
+  return [...new Uint8Array(bytes)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function sha256File(path: string): Promise<string> {
+  return hex(await crypto.subtle.digest("SHA-256", await Deno.readFile(path)));
+}
+
+async function prepareLocalSource(appName: string, declaredVersion: string, infoObj: ScoopixApp, opts: any) {
+  if (!opts.sourceFile) return null;
+  const livePath = await Deno.realPath(opts.sourceFile);
+  const formalVersion = await formalSourceVersion(livePath, infoObj);
+  const sha256 = await sha256File(livePath);
+  const shortSha = sha256.slice(0, 12);
+  const version = `${formalVersion}-direct.g${shortSha}`;
+  const extension = extname(livePath) || ".src";
+  const snapshotPath = join(CACHE_DIR, "direct-sources", `${safeStateName(appName)}#${safeStateName(version)}${extension}`);
+  await ensureDir(dirname(snapshotPath));
+  if (opts.ignoreDownloadCache || !(await exists(snapshotPath))) {
+    await Deno.copyFile(livePath, snapshotPath);
+  }
+
+  return {
+    sourcePath: snapshotPath,
+    version,
+    local: {
+      livePath,
+      snapshotPath,
+      sha256,
+      shortSha,
+      formalVersion,
+      manifestVersion: declaredVersion,
+    },
+  };
+}
+
 async function discoverGitFileVersions(appName: string, infoObj: ScoopixApp, source?: ScoopixVersionsFinder): Promise<string[]> {
   const sourceInfo = sourceGitInfo(infoObj);
   if (!sourceInfo) return [];
@@ -1490,8 +1597,11 @@ async function buildRustWithLocalRustc(appName: string, version: string, infoObj
   const buildInfo = await buildSourcePlaceholders(appName, version, infoObj, opts.git ?? {});
   const sourceInfo = sourceGitInfo(infoObj);
   return {
-    sourceType: opts.git ? "git" : "url",
+    sourceType: opts.localSource ? "direct" : opts.git ? "git" : "url",
     url: infoObj.url,
+    sourceFile: opts.localSource?.livePath,
+    cachedSource: opts.localSource?.snapshotPath,
+    sourceSha256: opts.localSource?.sha256,
     git: sourceInfo?.git,
     ref: sourceInfo?.ref,
     path: sourceInfo?.path,
@@ -1499,8 +1609,8 @@ async function buildRustWithLocalRustc(appName: string, version: string, infoObj
     shortCommit: opts.git?.shortSha,
     commitCount: opts.git?.count,
     commitDate: opts.git?.isoDate,
-    formalVersion: opts.git?.formalVersion,
-    manifestVersion: opts.git?.manifestVersion ?? infoObj.version,
+    formalVersion: opts.localSource?.formalVersion ?? opts.git?.formalVersion,
+    manifestVersion: opts.localSource?.manifestVersion ?? opts.git?.manifestVersion ?? infoObj.version,
     authorName: opts.git?.authorName,
     authorEmail: opts.git?.authorEmail,
     committerName: opts.git?.committerName,
@@ -1630,7 +1740,10 @@ async function installApp(app: string, opts: any = {}) {
   const parsed = parseVersionedAppSpec(app);
   const requestedVersion = installOpts.version ?? parsed.version;
 
-  const resolved = await resolveAppInfo(parsed.app);
+  if (!installOpts.sourceFile && parsed.app.toLowerCase().endsWith(".rs")) {
+    installOpts.sourceFile = parsed.app;
+  }
+  const resolved = await resolveAppInfo(parsed.app, installOpts);
   const appName = resolved.appName;
   const bucket = resolved.bucket;
   let version = installOpts.resolvedVersion ?? resolved.version;
@@ -1674,23 +1787,30 @@ async function installApp(app: string, opts: any = {}) {
     return;
   }
 
+  if (installOpts.sourceFile && !(infoObj.type === "src" && infoObj.rustc)) {
+    throw new Error("direct local source installs are currently supported only for rustc source packages");
+  }
+
   if (infoObj.type === "src" && infoObj.rustc && !installOpts.approveRustcBuild) {
     throw rustcBuildApprovalError(appName, infoObj, installOpts.requestedApp);
   }
 
-  const gitSource = infoObj.type === "src" && infoObj.rustc ? await prepareGitSource(appName, version, infoObj, installOpts) : null;
-  if (gitSource) {
-    version = gitSource.version;
+  const localSource = infoObj.type === "src" && infoObj.rustc ? await prepareLocalSource(appName, version, infoObj, installOpts) : null;
+  const gitSource = !localSource && infoObj.type === "src" && infoObj.rustc ? await prepareGitSource(appName, version, infoObj, installOpts) : null;
+  if (localSource || gitSource) {
+    version = (localSource ?? gitSource)!.version;
     infoObj = { ...infoObj, version };
-    installOpts.sourcePath = gitSource.sourcePath;
-    installOpts.git = gitSource.git;
+    installOpts.sourcePath = (localSource ?? gitSource)!.sourcePath;
+    if (localSource) installOpts.localSource = localSource.local;
+    if (gitSource) installOpts.git = gitSource.git;
   }
 
-  const binNames = appBinNames(infoObj.bin, appName);
-  const binName = binNames[0];
-  const shimName = infoObj.shim ?? shimNameFromBin(binName);
   const packageId = `${bucket}/${appName}`;
-  await assertAppAvailable(appName, packageId, version);
+  const binNames = appBinNames(infoObj.bin, appName);
+  const shimNames = resolveShimNames(binNames, infoObj, installOpts, await ownedShimStates(packageId));
+  const binName = binNames[0];
+  const shimName = shimNames[0];
+  await assertAppAvailable(appName, packageId, version, installOpts);
   const { appDir, dest } = await prepareAppDirectories(appName, version, binName);
   const canUseInstalled = !installOpts.ignoreBuildCache && !installOpts.ignoreDownloadCache;
   const allDestinationsExist = async () => {
@@ -1718,9 +1838,10 @@ async function installApp(app: string, opts: any = {}) {
         appName,
         version,
         candidate,
-        index === 0 ? shimName : shimNameFromBin(candidate),
+        shimNames[index],
       );
     }
+    await removeObsoleteOwnedShims(packageId, new Set(shimNames));
     if (!installOpts.suppressOutput) {
       console.log(`Relinked existing: ${packageId}:${version}.`);
       await postInstallVerify(packageId, appName, version, infoObj, binName, shimName);
@@ -1743,8 +1864,9 @@ async function installApp(app: string, opts: any = {}) {
   }
 
   for (const [index, candidate] of binNames.entries()) {
-    await linkAppBinaries(packageId, appName, version, candidate, index === 0 ? shimName : shimNameFromBin(candidate), provenance);
+    await linkAppBinaries(packageId, appName, version, candidate, shimNames[index], provenance);
   }
+  await removeObsoleteOwnedShims(packageId, new Set(shimNames));
   if (!installOpts.suppressOutput) {
     await postInstallVerify(packageId, appName, version, infoObj, binName, shimName);
   }
@@ -1847,11 +1969,14 @@ async function removeAppState(appName: string) {
   await Deno.remove(appStatePath(appName)).catch(() => {});
 }
 
-async function assertAppAvailable(appName: string, requestedOwner: string, version: string) {
+async function assertAppAvailable(appName: string, requestedOwner: string, version: string, opts: any = {}) {
   const state = await readAppState(appName);
   if (state && state.owner !== requestedOwner) {
+    const hint = requestedOwner.startsWith("local/") && !opts.name
+      ? ` Use --name to choose a separate package identity, for example: --name ${appName}-dev. Use --as only for the command/shim name.`
+      : "";
     throw new Error(
-      `package collision: app directory '${appName}' is already owned by ${state.owner}:${state.version}; requested by ${requestedOwner}:${version}`,
+      `package collision: app directory '${appName}' is already owned by ${state.owner}:${state.version}; requested by ${requestedOwner}:${version}.${hint}`,
     );
   }
 
@@ -1867,6 +1992,24 @@ async function readShimState(shimName: string): Promise<ShimState | null> {
   } catch {
     return null;
   }
+}
+
+async function ownedShimStates(owner: string): Promise<ShimState[]> {
+  const states: ShimState[] = [];
+  try {
+    for await (const entry of Deno.readDir(SHIMS_STATE_DIR)) {
+      if (!entry.isFile || !entry.name.endsWith(".json")) continue;
+      try {
+        const state = JSON.parse(await Deno.readTextFile(join(SHIMS_STATE_DIR, entry.name))) as ShimState;
+        if (state.owner === owner) states.push(state);
+      } catch {
+        warn(`Ignoring unreadable shim state '${entry.name}'.`);
+      }
+    }
+  } catch {
+    return [];
+  }
+  return states;
 }
 
 async function writeShimState(shimName: string, owner: string, version: string, target: string) {
@@ -1943,6 +2086,13 @@ async function removeOwnedShim(candidate: string, requestedOwner: string | null)
   return true;
 }
 
+async function removeObsoleteOwnedShims(owner: string, keepNames: Set<string>) {
+  for (const state of await ownedShimStates(owner)) {
+    if (keepNames.has(state.name)) continue;
+    await removeOwnedShim(join(BIN_DIR, state.name), owner);
+  }
+}
+
 async function uninstallApp(app: string, opts: { all?: boolean } = {}) {
   const parsed = parseVersionedAppSpec(app);
   const appSpec = parsed.app;
@@ -1958,8 +2108,10 @@ async function uninstallApp(app: string, opts: { all?: boolean } = {}) {
     );
   }
 
+  const ownedShimCandidates = owner ? (await ownedShimStates(owner)).map((state) => join(BIN_DIR, state.name)) : [];
   const candidates = [
     ...new Set([
+      ...ownedShimCandidates,
       join(BIN_DIR, shimName),
       join(BIN_DIR, appName),
       join(DEFAULT_BIN_DIR, shimName),
@@ -2001,6 +2153,9 @@ async function uninstallApp(app: string, opts: { all?: boolean } = {}) {
 
   console.log(`Uninstalled '${app}':`);
   for (const path of removed) console.log(`  removed ${path}`);
+  if (removed.some((path) => path.startsWith(BIN_DIR) || path.startsWith(DEFAULT_BIN_DIR))) {
+    console.log("If Bash still tries a removed command path, clear its command cache with: hash -r");
+  }
 }
 async function buildFromSource(
   app: string,
@@ -3321,6 +3476,7 @@ function assertNotIncludes(haystack: string, needle: string, message: string) {
 const AUTOTESTS = [
   "locks",
   "install-force",
+  "install-alias",
   "install-version",
   "version-sources",
 ];
@@ -3472,6 +3628,34 @@ async function runAutotest(test = "all") {
       }
     };
 
+    const testInstallAlias = async () => {
+      status("autotest: install --as creates an alternate primary shim");
+      await installApp("alpha/same", { as: "same2", ignoreDownloadCache: true });
+      const aliasState = await readShimState("same2");
+      if (aliasState?.owner !== "alpha/same") {
+        throw new Error(`--as should record same2 shim owner alpha/same, got ${JSON.stringify(aliasState)}`);
+      }
+      if (await readShimState("same")) {
+        throw new Error("--as should remove obsolete default shim state for same");
+      }
+
+      status("autotest: install --shim-prefix prefixes installed shims");
+      await installApp("alpha/same", { shimPrefix: "x-", ignoreDownloadCache: true });
+      const prefixedState = await readShimState("x-same");
+      if (prefixedState?.owner !== "alpha/same") {
+        throw new Error(`--shim-prefix should record x-same shim owner alpha/same, got ${JSON.stringify(prefixedState)}`);
+      }
+      if (await readShimState("same2")) {
+        throw new Error("--shim-prefix should remove obsolete alias shim state for same2");
+      }
+
+      status("autotest: uninstall removes recorded alternate shim state");
+      await uninstallApp("same", { all: true });
+      if (await readShimState("x-same")) {
+        throw new Error("uninstall should remove recorded prefixed shim state for x-same");
+      }
+    };
+
     const testInstallVersion = async () => {
       status("autotest: install app@version resolves versionsFinder");
       await installApp("alpha/same@2.0", { ignoreDownloadCache: true });
@@ -3508,6 +3692,11 @@ async function runAutotest(test = "all") {
       console.log("autotest passed: install-force");
       return;
     }
+    if (test === "install-alias") {
+      await testInstallAlias();
+      console.log("autotest passed: install-alias");
+      return;
+    }
     if (test === "install-version") {
       await testInstallVersion();
       console.log("autotest passed: install-version");
@@ -3521,6 +3710,7 @@ async function runAutotest(test = "all") {
 
     await testLocks();
     await testInstallForce();
+    await testInstallAlias();
     await testInstallVersion();
     await testVersionSources();
 
@@ -3708,13 +3898,16 @@ await new Command()
       Deno.exit(1);
     }
   })
-  .command("install <app:string>", "Install an app from all buckets")
+  .command("install <app:string>", "Install a bucket app or direct source")
   .option("--version <version:string>", "Install this exact discovered version")
   .option("-f, --force", "Force reinstall, ignoring download/build/artifact caches")
   .option("--ignore-build-cache", "Force rebuild from source, ignoring cached Docker image")
   .option("--ignore-download-cache", "Force re-download even if cached")
   .option("--force-artifact-build", "Force rebuilding artifact outputs even if cached")
   .option("--approve-rustc-build", "Allow compiling downloaded Rust source with local rustc")
+  .option("--as <name:string>", "Install the primary command shim under this name")
+  .option("--name <name:string>", "Set the app identity for direct local source installs")
+  .option("--shim-prefix <prefix:string>", "Prefix all installed command shim names")
   .option("--aria2", "Use aria2c for HTTP(S) downloads instead of the built-in downloader")
   .option("--keep-temp", "Keep extracted files in ~/.scoopix/temp/<app>")
   .option("--system", "Run system install commands after building, requires root")
@@ -3737,12 +3930,15 @@ await new Command()
           ignoreDownloadCache: opts.force || opts.ignoreDownloadCache,
           forceArtifactBuild: opts.force || opts.forceArtifactBuild,
           approveRustcBuild: opts.approveRustcBuild,
+          as: opts.as,
+          name: opts.name,
+          shimPrefix: opts.shimPrefix,
           version: opts.version,
           aria2: opts.aria2,
           keepTemp: opts.keepTemp,
           system: opts.system,
         });
-        if (!opts.autoconfig) {
+        if (opts.autoconfig) {
           await configurePath(undefined, { quietAlready: true });
         }
         await writeInstallState(app, "installed", { system: Boolean(opts.system) });
