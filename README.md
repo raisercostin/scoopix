@@ -14,6 +14,8 @@ Scoopix has evolved from "Scoop for Synology/Linux" into a more general installe
 
 Think of Scoopix less as a distro package manager and more as a portable installer substrate: a way to describe how a tool is obtained, built, exposed on `PATH`, upgraded, pinned, tested, and repeated across constrained machines.
 
+Longer-term, Scoopix should move toward URL-first packages with conventions. A package can be a URL to an archive, a Git repository, or a single source file; Scoopix can infer common builders and metadata when the source carries enough convention, while buckets remain catalogs and override layers. This is similar in spirit to Zig's package model: a package is a URL plus conventional build/metadata files when present. For Scoopix, future conventions might include `scoopix.json`, common files such as `build.zig`, `Cargo.toml`, `deno.json`, `Makefile`, or friendly single-file scripts with detectable versions.
+
 ## ✨ Features
 
 - **Bucket system** – JSON manifests define how apps are downloaded, extracted, or built.
@@ -265,6 +267,45 @@ The safest install path is not determined by whether the package starts as sourc
 
 Future Windows shim option: Scoopix currently uses simple shims in `~/.scoopix/bin`. A Scoop-style generic launcher plus adjacent `.shim` metadata may be added for Windows, especially for tools that need sidecar DLLs, a specific working directory, extra environment variables, or launcher-managed arguments.
 
+## FAQ
+
+### Should Scoopix follow the XDG Base Directory Specification?
+
+Scoopix keeps the Scoop-style install root as the default instead of splitting files across the [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir/latest/#index). The default layout is intentionally portable and inspectable:
+
+```text
+~/.scoopix/
+  apps/
+  bin/
+  buckets/
+  cache/
+  temp/
+  state/
+  share/man/
+```
+
+This fits Scoopix's goals across Linux, Synology, Entware, WSL, Git Bash, and Windows-adjacent workflows. A single root is easy to copy, delete, back up, inspect, and reason about on constrained systems. It also preserves the Scoop mental model: one home, per-version app directories, a `current` link, cache, buckets, state, and shims in a predictable place.
+
+XDG is still useful for users who want freedesktop-style integration. It should be treated as an opt-in layout, not the default. `SCOOPIX_HOME` should continue to override everything because it is the clean portable mode.
+
+A future `SCOOPIX_XDG=1` mode could map paths like this:
+
+```text
+apps        -> $XDG_DATA_HOME/scoopix/apps
+buckets     -> $XDG_CONFIG_HOME/scoopix/buckets or $XDG_DATA_HOME/scoopix/buckets
+state       -> $XDG_STATE_HOME/scoopix
+cache       -> $XDG_CACHE_HOME/scoopix
+temp        -> $TMPDIR/scoopix or $XDG_CACHE_HOME/scoopix/temp
+bin         -> $HOME/.local/bin or a configured Scoopix bin directory
+man         -> $XDG_DATA_HOME/man or $XDG_DATA_HOME/scoopix/share/man
+```
+
+If the corresponding XDG variables are unset, the usual freedesktop defaults would apply, such as `$HOME/.local/share`, `$HOME/.config`, `$HOME/.local/state`, and `$HOME/.cache`.
+
+An XDG mode should not change package semantics. `apps/<name>/<version>`, `current`, shims, cache, buckets, state, and provenance should behave the same regardless of layout. The layout choice should only affect where those directories live.
+
+Practical policy: keep `~/.scoopix` as the default portable root, consider XDG as an opt-in layout later, and always make `scoopix config path` / `scoopix info` show the resolved paths.
+
 ## 📖 History
 
 * **2026-06-15** – Added the full Synology WireGuard path: generic host/DSM doctor data, source-built `wireguard-tools`, source-built Synology kernel-module SPK, system install/start checks, safe local and remote peer tests, `wg` command metadata in `list`, automatic path/manpath initialization, automatic default `main` bucket setup, and one-line `sudo scoopix install main/wireguard --system`.
@@ -283,12 +324,20 @@ Working now:
 
 * `install` creates versioned app installs, a stable `current` link, and command shims in `~/.scoopix/bin`.
 * `config path` configures both shell startup files and, on Windows, the Windows user `PATH`; `--remove` reverses only Scoopix PATH entries.
+* `versionsFinder` discovers installable versions from GitHub releases, web indexes, multiple web regex sources, and Git file history.
 * `upgrade micro` follows the installed owner bucket and can upgrade from upstream `versionsFinder`.
+* `srcVersionDetector` can extract a formal source version and inject the derived build version into friendly source builds.
+* `install main/rtee --approve-rustc-build` compiles a Git-backed single-file Rust source with local `rustc`, stores provenance, and installs the generated executable.
+* `info <app>` shows installed provenance such as Git commit, author, committer, signature status, builder, build time, user, and host when available.
+* Archive installs can preserve extracted application trees and expose multiple shims, used by the Windows ArangoDB package.
 * Manifest `healthcheck` can verify the installed target after install or upgrade.
 
 Remaining work:
 
 * Add a Scoop-style Windows `.exe` shim launcher plus `.shim` metadata for sidecar DLL, cwd, env, and argument handling.
+* Add Docker-backed Rust/source builds behind an explicit `--approve-docker-build` trust gate.
+* Add direct URL installs for metadata-light single-file sources after manifest installs are solid.
+* Add persisted approval records keyed by source URL, version, commit/hash, and build strategy.
 * Add non-mutating/dry-run output for PATH configuration and removal.
 * Expand automated tests around PATH config strategies and Windows registry updates.
 
@@ -296,6 +345,10 @@ Remaining work:
 
 * [ ] Improve archive auto-detection (`tar.gz`, `zip`).
 * [ ] Add hash checking support (like Scoop).
+* [ ] Add signature/checksum display in `info` for binary and source installs.
+* [ ] Add `--approve-docker-build` and Docker fallback for Rust/source installs.
+* [ ] Add direct `scoopix install <url>` for simple Git/blob source URLs.
+* [ ] Explore URL-first package conventions so buckets can shrink to catalogs/overrides when upstream carries enough metadata.
 * [ ] Distributed buckets (community buckets).
 * [ ] Tests and CI integration.
 * [ ] More modern tools in synology: gdu, bat, iotop, rg/ripgrep, ag, duf, fzf, plocate, zstd

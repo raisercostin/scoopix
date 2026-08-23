@@ -1250,7 +1250,8 @@ function appBinNames(bin: ScoopixBinary | undefined, appName: string): string[] 
 }
 
 function shimNameFromBin(binName: string): string {
-  return basename(binName).replace(/\.exe$/i, "");
+  const name = basename(binName);
+  return Deno.build.os === "windows" ? name : name.replace(/\.exe$/i, "");
 }
 
 function rustcBuildApprovalError(appName: string, infoObj: ScoopixApp, requestedApp?: string): Error {
