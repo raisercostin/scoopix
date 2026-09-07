@@ -1,0 +1,2 @@
+- 2026-09-07T18:44:14+03 #actor/migration migrated source=".changes/ch002-deno-git-bash-path"
+- 2026-09-07T18:44:14+03 #actor/actor01 closed reason="implemented reinstall command for current app version or source identity"

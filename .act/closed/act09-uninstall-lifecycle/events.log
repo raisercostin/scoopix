@@ -1,0 +1,2 @@
+- 2026-09-07T18:44:14+03 #actor/migration migrated source=".changes/ch007-uninstall-lifecycle"
+- 2026-09-07T18:44:15+03 #actor/actor01 closed reason="implemented artifact sha256 provenance"

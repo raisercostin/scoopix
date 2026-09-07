@@ -1,0 +1,2 @@
+- 2026-09-07T18:44:14+03 #actor/migration migrated source=".changes/ch004-arangodb-windows-installer"
+- 2026-09-07T18:44:14+03 #actor/actor01 closed reason="implemented switch command for already installed versions"

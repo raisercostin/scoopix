@@ -1,0 +1,2 @@
+- 2026-09-07T18:44:14+03 #actor/migration migrated source=".changes/ch006-command-taxonomy"
+- 2026-09-07T18:44:15+03 #actor/actor01 closed reason="implemented initial bucket maintainer discover apply import ignore test commit push reset lint workflow"

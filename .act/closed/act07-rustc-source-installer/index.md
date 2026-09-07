@@ -27,6 +27,10 @@ Compiling a remote Rust file creates a native executable that runs with the user
 - Added source replacement support and `srcVersionDetector`, which extracts the formal source version and by default replaces that captured version with the derived build version before compilation.
 - Added installed app provenance metadata and `scoopix info <app>` for Git commit/build details.
 - Added direct local `.rs` installs, for example `scoopix install ./sudo.rs --approve-rustc-build`, which cache exact source bytes and derive a hash-based install version without requiring a bucket entry.
+- Added `scoopix upgrade <name>` support for direct local `.rs` installs; it refreshes from the recorded `sourceFile` provenance so the original path does not have to be supplied again.
+- Changed direct local `.rs` version identity so `g...` only means Git commit and `h...` means exact source content hash. Git worktree installs use `<formal-version>-<commit-date>.<commit-count>.<branch>.g<commit>.h<source-hash>`; non-Git installs use `<formal-version>-<mtime-utc>.h<source-hash>`.
+- Added install `--live` for direct local `.rs` installs to record `source mode: live` in provenance while keeping refresh explicit through `upgrade <name>`.
+- Added artifact SHA-256 provenance for installed primary artifacts.
 - Added `install --as <name>` and `install --shim-prefix <prefix>` so packages can avoid command-name collisions while preserving package identity.
 - Updated uninstall to remove recorded Scoopix-owned shim state, including aliased and prefixed shims, and to suggest `hash -r` for stale Bash command caches.
 - Added `main/rtee`, sourced from `https://github.com/raisercostin/scripts/blob/main/rtee.rs` with homepage `https://github.com/raisercostin/scripts/blob/main/rtee.md`.
@@ -52,3 +56,4 @@ Verified locally on Windows with an isolated `HOME`:
 - `scoopix info main/rtee` prints source URL, ref, path, full commit, commit date/count, author, committer, signature status, builder, rustc version, build time, and build user/host.
 - `scoopix install main/sudo --approve-rustc-build` builds `sudo.exe`, and `rtee sudo <command>` can spawn it as a native executable.
 - `scoopix install ./tool.rs --name direct-smoke --as direct-smoke-test --approve-rustc-build --no-autoconfig` builds a direct local Rust source install from a cached source copy and runs the generated command.
+- `scoopix upgrade rteel-test --approve-rustc-build` refreshes a direct local Rust source install from the source path recorded during install.

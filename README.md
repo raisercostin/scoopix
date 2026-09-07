@@ -107,11 +107,20 @@ Commands:
   autotest              - Run built-in tests
   install      <app>    - Install an app from all buckets
   upgrade      [app]    - Upgrade one installed app, or all installed apps
-  update       <app>    - Update a local bucket manifest entry
+  reinstall    <app>    - Reinstall the current app version or source identity
+  downgrade    <app>    - Install an explicit older app version
+  switch       <app>    - Switch current symlink to an already installed version
+  cleanup      <app>    - Remove old installed versions while keeping current
+  pin          <app>    - Pin current or explicit app version
+  unpin        <app>    - Remove app pin
+  fetch        [target] - Fetch configured bucket metadata without changing installed apps
+  update       [target] - Compatibility alias for fetch
   uninstall    <app>    - Uninstall an app
   config                - Configure Scoopix
   bucket                - Manage buckets
-  list                  - List all apps in all buckets
+  list                  - List installed apps; use --all for bucket catalog apps
+  search                - Search configured bucket catalog apps
+  available             - List available bucket catalog apps, optionally filtered
   installed             - List installed apps
   versions     <app>    - List installed, saved, bucket, and source versions
   checkver     <app>    - Check whether an app manifest is current
@@ -197,14 +206,97 @@ scoopix install ../scripts/sudo.rs --name sudo-dev --as sudo2 --approve-rustc-bu
 sudo2 --version
 ```
 
-Direct local Rust installs are normal installs. Scoopix copies the current source bytes into `~/.scoopix/cache/direct-sources`, derives the installed version from the source-declared version plus a source hash, builds that cached copy, and leaves previous versions under `~/.scoopix/apps/<name>/<version>`. Future live installs are planned separately for source paths that should rebuild automatically when the file changes.
+Direct local Rust installs are normal installs. Scoopix records the original source path in app provenance, copies the current source bytes into `~/.scoopix/cache/direct-sources`, derives the installed version from the source-declared version plus source identity, builds that cached copy, and leaves previous versions under `~/.scoopix/apps/<name>/<version>`.
+
+For local files inside a Git worktree, the version is anchored to the current commit and the exact source snapshot hash:
+
+```text
+<formal-version>-<commit-date>.<commit-count>.<branch>.g<commit>.h<source-hash>
+```
+
+For local files outside Git, the version uses file mtime plus the exact source snapshot hash:
+
+```text
+<formal-version>-<mtime-utc>.h<source-hash>
+```
+
+`g...` always means Git commit, and `h...` always means source content hash. Build-specific facts such as build time, builder host, `rustc` version, and cached source path are kept in `scoopix info <name>` provenance instead of the package version.
+
+After editing the source file, refresh the installed package by app identity without repeating the source path:
+
+```bash
+scoopix upgrade sudo-dev --approve-rustc-build
+sudo2 --version
+```
+
+Use `--ignore-build-cache` if you need to rebuild the same source version even when the source hash did not change. In Scoopix, `fetch` refreshes configured bucket metadata, `bucket apply <app> <version>` mutates a local bucket manifest, and `upgrade <name>` makes an installed package current from its known source. Future live installs are planned separately for source paths that should rebuild automatically when the command is run.
+
+Use `--live` to mark a direct local source as intentionally followed by path. It records `source mode: live` in provenance; refresh still happens explicitly through `upgrade <name>`:
+
+```bash
+scoopix install --live ../scripts/rtee.rs --name rteel --as rteel --approve-rustc-build
+scoopix upgrade rteel --approve-rustc-build
+```
 
 ### Upgrade and version selection
+
+Scoopix separates three responsibilities:
+
+- Using apps: `install`, `upgrade`, `reinstall`, `downgrade`, `switch`, `cleanup`, `uninstall`, `pin`, `unpin`, `versions`, and `info`.
+- Using buckets: `fetch`, `search`, `available`, `list --all`, `bucket add`, `bucket remove`, and `bucket list`.
+- Maintaining buckets: `bucket discover`, `bucket apply`, `bucket import`, `bucket ignore`, `bucket test`, `bucket commit`, `bucket push`, `bucket reset`, and `bucket lint`.
+
+Use `list` to show installed apps:
+
+```bash
+scoopix list
+scoopix installed
+```
+
+Use `list --all`, `search`, or `available` to inspect configured bucket catalog apps:
+
+```bash
+scoopix list --all
+scoopix search rtee
+scoopix available rtee
+```
+
+Use `fetch` to refresh configured bucket metadata without changing installed apps:
+
+```bash
+scoopix fetch
+scoopix bucket fetch dev
+```
 
 `upgrade` is the normal user command for making an app current:
 
 ```bash
 scoopix upgrade micro
+```
+
+Use `reinstall` to rebuild or reinstall the current selected version/source identity:
+
+```bash
+scoopix reinstall rteel --approve-rustc-build
+```
+
+Use `switch` to select an already installed version without downloading/building a new one:
+
+```bash
+scoopix switch rteel@0.1.7-20260824.196.main.g2d47908.h037203ec61f6
+```
+
+Use `cleanup` to remove old installed version directories while keeping the current version:
+
+```bash
+scoopix cleanup rteel
+```
+
+Use `pin` to pin the current or explicit version. Pinned apps are skipped by bulk `scoopix upgrade` until `unpin` removes the pin:
+
+```bash
+scoopix pin rteel
+scoopix unpin rteel
 ```
 
 By default, Scoopix uses the bucket manifest and, when the manifest has `versionsFinder`, resolves the latest upstream version without mutating the bucket file. Use `app@version` or `--version` to install an exact discovered version, including downgrades:
@@ -243,6 +335,16 @@ Use `--update-bucket-manifest` to persist the resolved version back into a local
 ```bash
 scoopix upgrade micro@2.0.15 --update-bucket-manifest
 ```
+
+For bucket maintenance, prefer `bucket apply` over the legacy top-level update form:
+
+```bash
+scoopix bucket discover main/rtee
+scoopix bucket apply main/rtee 0.1.7
+scoopix bucket lint main
+```
+
+`scoopix update` is a compatibility alias for `scoopix fetch`.
 
 Use `--force-bucket-update` to run `git pull --ff-only` for matching local git-backed buckets before resolving versions. Remote raw buckets are fetched when loaded.
 

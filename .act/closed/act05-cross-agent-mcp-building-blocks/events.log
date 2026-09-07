@@ -1,0 +1,2 @@
+- 2026-09-07T18:44:14+03 #actor/migration migrated source=".changes/ch003-cross-agent-mcp-building-blocks"
+- 2026-09-07T18:44:14+03 #actor/actor01 closed reason="implemented pin and unpin with pins skipped by bulk upgrade"

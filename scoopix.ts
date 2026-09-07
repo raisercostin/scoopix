@@ -228,6 +228,7 @@ type AppState = {
 type SavedVersion = {
   version: string;
   reason?: string;
+  pinned?: boolean;
   savedAt: string;
 };
 
@@ -235,6 +236,13 @@ type SavedVersionsFile = {
   version: 1;
   apps: Record<string, SavedVersion[]>;
 };
+
+type IgnoredVersionsFile = {
+  version: 1;
+  apps: Record<string, { version: string; reason?: string; ignoredAt: string }[]>;
+};
+
+const IGNORED_VERSIONS_FILE = () => join(STATE_DIR, "ignored-versions.json");
 
 async function readConfig(): Promise<ScoopixConfig> {
   const cfgPath = join(SCOOPIX_HOME, "config.json");
@@ -308,6 +316,21 @@ async function writeSavedVersions(saved: SavedVersionsFile) {
   await chownToSudoUser(SAVED_VERSIONS_FILE);
 }
 
+async function readIgnoredVersions(): Promise<IgnoredVersionsFile> {
+  const path = IGNORED_VERSIONS_FILE();
+  if (!(await exists(path))) return { version: 1, apps: {} };
+  const parsed = JSON.parse(await Deno.readTextFile(path));
+  parsed.version ??= 1;
+  parsed.apps ??= {};
+  return parsed;
+}
+
+async function writeIgnoredVersions(ignored: IgnoredVersionsFile) {
+  await ensureDir(STATE_DIR);
+  await Deno.writeTextFile(IGNORED_VERSIONS_FILE(), JSON.stringify(ignored, null, 2) + "\n");
+  await chownToSudoUser(IGNORED_VERSIONS_FILE());
+}
+
 async function saveVersion(app: string, version?: string, reason?: string) {
   const parsed = parseVersionedAppSpec(app);
   const requestedVersion = version || parsed.version;
@@ -349,7 +372,8 @@ async function unsaveVersion(app: string, version?: string) {
 }
 
 function formatSavedEntry(appId: string, entry: SavedVersion): string {
-  return `${appId}@${entry.version}${entry.reason ? ` - ${entry.reason}` : ""}`;
+  const pin = entry.pinned ? " [pinned]" : "";
+  return `${appId}@${entry.version}${pin}${entry.reason ? ` - ${entry.reason}` : ""}`;
 }
 
 async function savedVersionEntries(appId?: string): Promise<string[]> {
@@ -377,6 +401,71 @@ async function printSavedVersions(app?: string) {
   for (const line of lines) console.log(line);
 }
 
+async function appIdForSavedState(app: string): Promise<{ appName: string; appId: string }> {
+  const parsed = parseVersionedAppSpec(app);
+  const appName = parsed.app.includes("/") ? parsed.app.split("/").pop()! : parsed.app;
+  const state = await readAppState(appName);
+  if (state?.owner) {
+    if (parsed.app.includes("/") && state.owner !== parsed.app) {
+      throw new Error(`'${appName}' is installed as ${state.owner}, not ${parsed.app}. Use '${state.owner}' or '${appName}'.`);
+    }
+    return { appName, appId: state.owner };
+  }
+  const resolved = await resolveAppMetadata(parsed.app);
+  return { appName: resolved.appName, appId: `${resolved.bucket}/${resolved.appName}` };
+}
+
+async function pinVersion(app: string, version?: string, reason?: string) {
+  const parsed = parseVersionedAppSpec(app);
+  const { appName, appId } = await appIdForSavedState(parsed.app);
+  const requestedVersion = version || parsed.version || await installedVersion(appName);
+  if (!requestedVersion) throw new Error(`pin requires an installed app or explicit version, for example: pin ${appName}@1.2.3`);
+  const saved = await readSavedVersions();
+  const entries = saved.apps[appId] ?? [];
+  const existing = entries.find((entry) => entry.version === requestedVersion);
+  if (existing) {
+    existing.pinned = true;
+    existing.reason = reason ?? existing.reason;
+    existing.savedAt = new Date().toISOString();
+  } else {
+    entries.push({ version: requestedVersion, reason, pinned: true, savedAt: new Date().toISOString() });
+  }
+  saved.apps[appId] = uniqueSortedVersions(entries.map((entry) => entry.version))
+    .map((entryVersion) => entries.find((entry) => entry.version === entryVersion)!);
+  await writeSavedVersions(saved);
+  console.log(`Pinned ${appId}@${requestedVersion}${reason ? ` - ${reason}` : ""}`);
+}
+
+async function unpinVersion(app: string, version?: string) {
+  const parsed = parseVersionedAppSpec(app);
+  const { appId } = await appIdForSavedState(parsed.app);
+  const requestedVersion = version || parsed.version;
+  const saved = await readSavedVersions();
+  const entries = saved.apps[appId] ?? [];
+  let changed = false;
+  const after = entries.map((entry) => {
+    if (requestedVersion && entry.version !== requestedVersion) return entry;
+    if (!entry.pinned) return entry;
+    changed = true;
+    const { pinned: _pinned, ...rest } = entry;
+    return rest;
+  });
+  if (!changed) throw new Error(requestedVersion ? `${appId}@${requestedVersion} is not pinned.` : `${appId} has no pinned versions.`);
+  const kept = after.filter((entry) => entry.reason || entry.pinned);
+  if (kept.length) saved.apps[appId] = kept;
+  else delete saved.apps[appId];
+  await writeSavedVersions(saved);
+  console.log(`Unpinned ${requestedVersion ? `${appId}@${requestedVersion}` : appId}`);
+}
+
+async function pinnedInstalledVersion(appName: string): Promise<SavedVersion | null> {
+  const state = await readAppState(appName);
+  const current = await installedVersion(appName);
+  if (!state?.owner || !current) return null;
+  const saved = await readSavedVersions();
+  return saved.apps[state.owner]?.find((entry) => entry.version === current && entry.pinned) ?? null;
+}
+
 async function formatAppLine(
   bucket: string,
   app: string,
@@ -393,7 +482,33 @@ async function formatAppLine(
     : `${appName}${provides}${installedText}`;
 }
 
-async function listApps(full: boolean, installedOnly = false) {
+function appMatchesQuery(bucket: string, app: string, meta: ScoopixApp, query?: string): boolean {
+  if (!query) return true;
+  const normalized = query.toLowerCase();
+  return [
+    bucket,
+    app,
+    `${bucket}/${app}`,
+    meta.description ?? "",
+    meta.homepage ?? "",
+    ...(meta.provides ?? []),
+  ].some((value) => value.toLowerCase().includes(normalized));
+}
+
+async function catalogAppLines(full: boolean, query?: string): Promise<string[]> {
+  const buckets = await loadAllBuckets();
+  const lines: string[] = [];
+  for (const [bucket, manifest] of buckets) {
+    for (const [app, meta] of Object.entries(manifest)) {
+      if (!appMatchesQuery(bucket, app, meta, query)) continue;
+      const installed = await installedVersion(app);
+      lines.push(await formatAppLine(bucket, app, meta, installed, full));
+    }
+  }
+  return lines;
+}
+
+async function listApps(full: boolean, installedOnly = true, query?: string) {
   info(`listApps called with full=${full}`);
 
   if (installedOnly) {
@@ -401,18 +516,12 @@ async function listApps(full: boolean, installedOnly = false) {
     return;
   }
 
-  const buckets = await loadAllBuckets();
-  if (buckets.size === 0) {
-    info("listApps: no buckets loaded");
-    console.log("No apps available");
+  const lines = await catalogAppLines(full, query);
+  if (lines.length === 0) {
+    console.log(query ? `No apps matched '${query}'.` : "No apps available.");
     return;
   }
-  for (const [bucket, manifest] of buckets) {
-    for (const [app, meta] of Object.entries(manifest)) {
-      const installed = await installedVersion(app);
-      console.log(await formatAppLine(bucket, app, meta, installed, full));
-    }
-  }
+  for (const line of lines) console.log(line);
 
   info("listApps completed");
 }
@@ -832,15 +941,16 @@ async function gitRootForBucketPath(path: string): Promise<string | null> {
   return result.code === 0 ? result.stdout.trim() : null;
 }
 
-async function forceBucketUpdate(app?: string) {
+async function forceBucketUpdate(target?: string) {
   await ensureDefaultMainBucket();
   const entries = await listBuckets();
-  const parsed = app ? parseVersionedAppSpec(app) : undefined;
+  const parsed = target ? parseVersionedAppSpec(target) : undefined;
   const requestedBucket = parsed?.app.includes("/") ? parsed.app.split("/", 2)[0] : null;
+  const targetBucket = requestedBucket ?? entries.find((entry) => entry.name === target)?.name ?? null;
   const touched = new Set<string>();
 
   for (const { name, path } of entries) {
-    if (requestedBucket && name !== requestedBucket) continue;
+    if (targetBucket && name !== targetBucket) continue;
     const root = await gitRootForBucketPath(path);
     if (!root || touched.has(root)) continue;
     touched.add(root);
@@ -852,6 +962,118 @@ async function forceBucketUpdate(app?: string) {
   if (touched.size === 0) {
     status("No git-backed local buckets to update.");
   }
+}
+
+async function bucketGitRoot(bucketName: string): Promise<string> {
+  const path = await bucketPath(bucketName);
+  if (!path) throw new Error(`Bucket '${bucketName}' is not configured.`);
+  if (path.startsWith("http://") || path.startsWith("https://")) {
+    throw new Error(`Bucket '${bucketName}' is remote-only; clone it locally before maintaining it.`);
+  }
+  const root = await gitRootForBucketPath(path);
+  if (!root) throw new Error(`Bucket '${bucketName}' is not git-backed: ${path}`);
+  return root;
+}
+
+async function bucketNameFromApp(app: string): Promise<string> {
+  const parsed = parseVersionedAppSpec(app);
+  if (parsed.app.includes("/")) return parsed.app.split("/", 2)[0];
+  const { bucket } = await resolveAppMetadata(parsed.app);
+  return bucket;
+}
+
+async function bucketDiscover(app: string) {
+  await printVersions(app);
+}
+
+async function bucketImport(app: string, requestedVersion?: string) {
+  const parsed = parseVersionedAppSpec(app);
+  const targetVersion = requestedVersion ?? parsed.version;
+  const { appName, bucket, info: infoObj } = await resolveAppMetadata(parsed.app);
+  const appId = `${bucket}/${appName}`;
+  const versions = targetVersion ? [targetVersion] : await discoverVersions(appId, infoObj);
+  const saved = await readSavedVersions();
+  const entries = saved.apps[appId] ?? [];
+  for (const version of versions) {
+    if (!entries.some((entry) => entry.version === version)) {
+      entries.push({ version, reason: "imported", savedAt: new Date().toISOString() });
+    }
+  }
+  saved.apps[appId] = uniqueSortedVersions(entries.map((entry) => entry.version))
+    .map((version) => entries.find((entry) => entry.version === version)!);
+  await writeSavedVersions(saved);
+  console.log(`Imported ${versions.length} version${versions.length === 1 ? "" : "s"} for ${appId}.`);
+}
+
+async function bucketIgnore(app: string, version: string, reason?: string) {
+  const { appName, bucket } = await resolveAppMetadata(parseVersionedAppSpec(app).app);
+  const appId = `${bucket}/${appName}`;
+  const ignored = await readIgnoredVersions();
+  const entries = ignored.apps[appId] ?? [];
+  const existing = entries.find((entry) => entry.version === version);
+  if (existing) {
+    existing.reason = reason ?? existing.reason;
+    existing.ignoredAt = new Date().toISOString();
+  } else {
+    entries.push({ version, reason, ignoredAt: new Date().toISOString() });
+  }
+  ignored.apps[appId] = entries;
+  await writeIgnoredVersions(ignored);
+  console.log(`Ignored ${appId}@${version}${reason ? ` - ${reason}` : ""}`);
+}
+
+async function bucketTest(app: string, opts: any = {}) {
+  await installApp(app, { ...opts, ignoreBuildCache: true, ignoreDownloadCache: true, forceArtifactBuild: true });
+}
+
+async function bucketCommit(target: string | undefined, message: string | undefined) {
+  const bucketName = target ? await bucketNameFromApp(target) : "main";
+  const root = await bucketGitRoot(bucketName);
+  const path = await bucketPath(bucketName);
+  if (!path) throw new Error(`Bucket '${bucketName}' is not configured.`);
+  const appName = target?.includes("/") ? target.split("/", 2)[1] : undefined;
+  const stat = await Deno.stat(path);
+  const targetPath = appName && stat.isDirectory ? join(path, `${appName}.json`) : path;
+  const relPath = relative(root, targetPath).replaceAll("\\", "/");
+  const commitMessage = message ?? `Update ${target ?? bucketName} bucket metadata`;
+  await runCommandWithLogs("git", ["-C", root, "add", relPath], `bucket commit stage ${bucketName}`, root, { briefFailure: true });
+  await runCommandWithLogs("git", ["-C", root, "commit", "-m", commitMessage], `bucket commit ${bucketName}`, root, { briefFailure: true });
+}
+
+async function bucketPush(bucketName = "main") {
+  const root = await bucketGitRoot(bucketName);
+  await runCommandWithLogs("git", ["-C", root, "push"], `bucket push ${bucketName}`, root, { briefFailure: true });
+}
+
+async function bucketReset(target: string) {
+  const bucketName = await bucketNameFromApp(target);
+  const root = await bucketGitRoot(bucketName);
+  const path = await bucketPath(bucketName);
+  if (!path) throw new Error(`Bucket '${bucketName}' is not configured.`);
+  const appName = target.includes("/") ? target.split("/", 2)[1] : undefined;
+  const stat = await Deno.stat(path);
+  const targetPath = appName && stat.isDirectory ? join(path, `${appName}.json`) : path;
+  const relPath = relative(root, targetPath).replaceAll("\\", "/");
+  await runCommandWithLogs("git", ["-C", root, "checkout", "--", relPath], `bucket reset ${target}`, root, { briefFailure: true });
+}
+
+async function bucketLint(target?: string) {
+  await ensureDefaultMainBucket();
+  const entries = await listBuckets();
+  const requestedBucket = target?.includes("/") ? target.split("/", 2)[0] : target;
+  let checked = 0;
+  for (const { name, path } of entries) {
+    if (requestedBucket && requestedBucket !== name) continue;
+    const manifest = await loadBucket(name, path);
+    if (!manifest) throw new Error(`Bucket '${name}' could not be loaded.`);
+    for (const [app, meta] of Object.entries(manifest)) {
+      if (target?.includes("/") && app !== target.split("/", 2)[1]) continue;
+      if (!meta.version) throw new Error(`${name}/${app}: missing version`);
+      if (meta.type !== "meta" && !meta.url && !meta.commands && !meta.arch && !meta.docker) throw new Error(`${name}/${app}: missing url, arch, docker, or commands`);
+      checked++;
+    }
+  }
+  console.log(`Bucket lint passed: ${checked} app${checked === 1 ? "" : "s"} checked.`);
 }
 
 async function resolveUpgradeTarget(app: string, opts: any = {}): Promise<{
@@ -968,6 +1190,7 @@ async function printAppInfo(app: string) {
     if (value !== undefined && value !== null && value !== "") console.log(`${label}: ${value}`);
   };
   print("source type", provenance.sourceType);
+  print("source mode", provenance.sourceMode);
   print("source", provenance.git ?? provenance.url);
   print("source file", provenance.sourceFile);
   print("cached source", provenance.cachedSource);
@@ -984,6 +1207,7 @@ async function printAppInfo(app: string) {
   print("signature key", provenance.signatureKey);
   print("builder", provenance.builder);
   print("rustc", provenance.rustc);
+  print("artifact sha256", provenance.artifactSha256);
   print("built at", provenance.buildTime);
   print("built by", provenance.buildUser && provenance.buildHost ? `${provenance.buildUser}@${provenance.buildHost}` : undefined);
 }
@@ -1004,7 +1228,41 @@ async function installedVersion(appName: string): Promise<string | null> {
   }
 }
 
+async function upgradeDirectLocalSource(app: string, opts: any = {}): Promise<boolean | null> {
+  const parsed = parseVersionedAppSpec(app);
+  const appName = parsed.app.includes("/") ? parsed.app.split("/").pop()! : parsed.app;
+  const state = await readAppState(appName);
+  const provenance = state?.provenance ?? {};
+  if (state?.owner !== `local/${appName}` || provenance.sourceType !== "direct") return null;
+  if (parsed.version || opts.version) {
+    throw new Error(`direct local source install '${appName}' cannot be upgraded with an explicit version`);
+  }
+  if (opts.fromBucket) {
+    throw new Error(`direct local source install '${appName}' has no bucket version; remove --from-bucket`);
+  }
+  const sourceFile = typeof provenance.sourceFile === "string" ? provenance.sourceFile : "";
+  if (!sourceFile) {
+    throw new Error(`direct local source install '${appName}' has no recorded source file; reinstall it with --name ${appName}`);
+  }
+  if (!(await exists(sourceFile))) {
+    throw new Error(`recorded source file for '${appName}' no longer exists: ${sourceFile}`);
+  }
+
+  const installed = await installedVersion(appName);
+  console.log(`${state.owner}: refreshing ${installed ?? state.version} from ${sourceFile}`);
+  await installApp(sourceFile, {
+    ...opts,
+    name: appName,
+    requestedApp: app,
+  });
+  const current = await installedVersion(appName);
+  return current !== installed || Boolean(opts.ignoreBuildCache || opts.ignoreDownloadCache || opts.forceArtifactBuild);
+}
+
 async function upgradeApp(app: string, opts: any = {}): Promise<boolean> {
+  const directSourceChanged = await upgradeDirectLocalSource(app, opts);
+  if (directSourceChanged !== null) return directSourceChanged;
+
   const target = await resolveUpgradeTarget(app, opts);
   const { appName, bucket, targetVersion: version } = target;
   const installed = await installedVersion(appName);
@@ -1041,6 +1299,44 @@ async function upgradeApp(app: string, opts: any = {}): Promise<boolean> {
   return true;
 }
 
+async function reinstallApp(app: string, opts: any = {}) {
+  const parsed = parseVersionedAppSpec(app);
+  const appName = parsed.app.includes("/") ? parsed.app.split("/").pop()! : parsed.app;
+  const state = await readAppState(appName);
+  if (!state) throw new Error(`'${app}' is not installed.`);
+  if (parsed.app.includes("/") && parsed.app !== state.owner) {
+    throw new Error(`'${appName}' is installed as ${state.owner}, not ${parsed.app}. Use '${state.owner}' or '${appName}'.`);
+  }
+  const provenance = state.provenance ?? {};
+  const sourceFile = typeof provenance.sourceFile === "string" ? provenance.sourceFile : "";
+  if (provenance.sourceType === "direct" && sourceFile) {
+    await installApp(sourceFile, {
+      ...opts,
+      name: appName,
+      requestedApp: app,
+      ignoreBuildCache: true,
+      ignoreDownloadCache: true,
+      forceArtifactBuild: true,
+    });
+    return;
+  }
+  const target = `${state.owner}@${state.version}`;
+  await installApp(target, {
+    ...opts,
+    ignoreBuildCache: true,
+    ignoreDownloadCache: true,
+    forceArtifactBuild: true,
+    requestedApp: app,
+  });
+}
+
+async function downgradeApp(app: string, opts: any = {}) {
+  const parsed = parseVersionedAppSpec(app);
+  const requestedVersion = opts.version ?? parsed.version;
+  if (!requestedVersion) throw new Error("downgrade requires a version, for example: downgrade rtee@1.2.3");
+  await upgradeApp(parsed.app, { ...opts, version: requestedVersion });
+}
+
 async function upgradeApps(app?: string, opts: any = {}) {
   if (opts.fromBucket && opts.fromSource) {
     throw new Error("--from-bucket and --from-source cannot be combined");
@@ -1064,6 +1360,12 @@ async function upgradeApps(app?: string, opts: any = {}) {
   let changed = false;
   for await (const entry of Deno.readDir(APPS_DIR)) {
     if (!entry.isDirectory) continue;
+    const pinned = await pinnedInstalledVersion(entry.name);
+    if (pinned) {
+      const state = await readAppState(entry.name);
+      console.log(`${state?.owner ?? entry.name}: pinned at ${pinned.version}; skipping`);
+      continue;
+    }
     changed = await upgradeApp(entry.name, opts) || changed;
   }
 }
@@ -1429,6 +1731,33 @@ function gitDerivedVersion(declaredVersion: string, date: string, count: string,
   return `${declaredVersion}-${date}.${count}.${safeVersionPart(ref)}.g${shortSha}`;
 }
 
+function compactUtcDateTime(date: Date): string {
+  const iso = date.toISOString();
+  return `${iso.slice(0, 4)}${iso.slice(5, 7)}${iso.slice(8, 10)}T${iso.slice(11, 13)}${iso.slice(14, 16)}${iso.slice(17, 19)}`;
+}
+
+async function localGitSourceInfo(sourcePath: string) {
+  const sourceDir = dirname(sourcePath);
+  const root = await gitOutput(["rev-parse", "--show-toplevel"], sourceDir).catch(() => "");
+  if (!root) return null;
+  const fullSha = await gitOutput(["rev-parse", "HEAD"], root);
+  const shortSha = await gitOutput(["rev-parse", "--short=7", "HEAD"], root);
+  const count = await gitOutput(["rev-list", "--count", "HEAD"], root);
+  const date = await gitOutput(["show", "-s", "--format=%cd", "--date=format:%Y%m%d", "HEAD"], root);
+  const isoDate = await gitOutput(["show", "-s", "--format=%cI", "HEAD"], root);
+  const branch = await gitOutput(["rev-parse", "--abbrev-ref", "HEAD"], root).catch(() => "HEAD");
+  const ref = branch && branch !== "HEAD" ? branch : "HEAD";
+  const path = relative(root, sourcePath).replaceAll("\\", "/");
+  const authorName = await gitOutput(["show", "-s", "--format=%an", "HEAD"], root);
+  const authorEmail = await gitOutput(["show", "-s", "--format=%ae", "HEAD"], root);
+  const committerName = await gitOutput(["show", "-s", "--format=%cn", "HEAD"], root);
+  const committerEmail = await gitOutput(["show", "-s", "--format=%ce", "HEAD"], root);
+  const subject = await gitOutput(["show", "-s", "--format=%s", "HEAD"], root);
+  const signatureStatus = await gitOutput(["show", "-s", "--format=%G?", "HEAD"], root).catch(() => "unknown");
+  const signatureKey = await gitOutput(["show", "-s", "--format=%GK", "HEAD"], root).catch(() => "");
+  return { gitRoot: root, ref, path, fullSha, shortSha, count, date, isoDate, authorName, authorEmail, committerName, committerEmail, subject, signatureStatus, signatureKey };
+}
+
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -1461,7 +1790,11 @@ async function prepareLocalSource(appName: string, declaredVersion: string, info
   const formalVersion = await formalSourceVersion(livePath, infoObj);
   const sha256 = await sha256File(livePath);
   const shortSha = sha256.slice(0, 12);
-  const version = `${formalVersion}-direct.g${shortSha}`;
+  const git = await localGitSourceInfo(livePath);
+  const fileTime = (await Deno.stat(livePath)).mtime ?? new Date();
+  const version = git
+    ? `${formalVersion}-${git.date}.${git.count}.${safeVersionPart(git.ref)}.g${git.shortSha}.h${shortSha}`
+    : `${formalVersion}-${compactUtcDateTime(fileTime)}.h${shortSha}`;
   const extension = extname(livePath) || ".src";
   const snapshotPath = join(CACHE_DIR, "direct-sources", `${safeStateName(appName)}#${safeStateName(version)}${extension}`);
   await ensureDir(dirname(snapshotPath));
@@ -1472,6 +1805,7 @@ async function prepareLocalSource(appName: string, declaredVersion: string, info
   return {
     sourcePath: snapshotPath,
     version,
+    git: git ? { ...git, formalVersion, manifestVersion: declaredVersion } : undefined,
     local: {
       livePath,
       snapshotPath,
@@ -1479,6 +1813,7 @@ async function prepareLocalSource(appName: string, declaredVersion: string, info
       shortSha,
       formalVersion,
       manifestVersion: declaredVersion,
+      live: Boolean(opts.live),
     },
   };
 }
@@ -1598,13 +1933,14 @@ async function buildRustWithLocalRustc(appName: string, version: string, infoObj
   const sourceInfo = sourceGitInfo(infoObj);
   return {
     sourceType: opts.localSource ? "direct" : opts.git ? "git" : "url",
+    sourceMode: opts.localSource?.live ? "live" : undefined,
     url: infoObj.url,
     sourceFile: opts.localSource?.livePath,
     cachedSource: opts.localSource?.snapshotPath,
     sourceSha256: opts.localSource?.sha256,
-    git: sourceInfo?.git,
-    ref: sourceInfo?.ref,
-    path: sourceInfo?.path,
+    git: sourceInfo?.git ?? opts.git?.gitRoot,
+    ref: sourceInfo?.ref ?? opts.git?.ref,
+    path: sourceInfo?.path ?? opts.git?.path,
     commit: opts.git?.fullSha,
     shortCommit: opts.git?.shortSha,
     commitCount: opts.git?.count,
@@ -1743,6 +2079,9 @@ async function installApp(app: string, opts: any = {}) {
   if (!installOpts.sourceFile && parsed.app.toLowerCase().endsWith(".rs")) {
     installOpts.sourceFile = parsed.app;
   }
+  if (installOpts.live && !installOpts.sourceFile) {
+    throw new Error("--live is currently supported only for direct local source installs");
+  }
   const resolved = await resolveAppInfo(parsed.app, installOpts);
   const appName = resolved.appName;
   const bucket = resolved.bucket;
@@ -1802,6 +2141,7 @@ async function installApp(app: string, opts: any = {}) {
     infoObj = { ...infoObj, version };
     installOpts.sourcePath = (localSource ?? gitSource)!.sourcePath;
     if (localSource) installOpts.localSource = localSource.local;
+    if (localSource?.git) installOpts.git = localSource.git;
     if (gitSource) installOpts.git = gitSource.git;
   }
 
@@ -1861,6 +2201,11 @@ async function installApp(app: string, opts: any = {}) {
     }
   } else {
     await installFromBinary(infoObj, dest, { ...opts, appName, version, installRoot: appDir });
+  }
+
+  const artifactSha256 = await sha256File(dest).catch(() => null);
+  if (artifactSha256) {
+    provenance = { ...(provenance ?? {}), artifactSha256 };
   }
 
   for (const [index, candidate] of binNames.entries()) {
@@ -2121,16 +2466,19 @@ async function uninstallApp(app: string, opts: { all?: boolean } = {}) {
   const parsed = parseVersionedAppSpec(app);
   const appSpec = parsed.app;
   const appName = appSpec.includes("/") ? appSpec.split("/").pop()! : appSpec;
-  const found = await findApp(appSpec, { allowInstalledOwnerStub: true });
-  const staleShimStates = found ? [] : await shimStatesForAppName(appName);
-  const owner = found ? `${found.bucket}/${appName}` : staleShimStates.length === 1 ? staleShimStates[0].owner : null;
+  const requestedOwner = appSpec.includes("/") ? appSpec : null;
+  const appState = await readAppState(appName);
+  if (requestedOwner && appState?.owner && appState.owner !== requestedOwner) {
+    throw new Error(`'${appName}' is installed as ${appState.owner}, not ${requestedOwner}. Use '${appState.owner}' or '${appName}'.`);
+  }
+  const staleShimStates = await shimStatesForAppName(appName);
+  const owner = requestedOwner ?? appState?.owner ?? (staleShimStates.length === 1 ? staleShimStates[0].owner : null);
+  const found = owner ? await findApp(owner, { allowInstalledOwnerStub: true }).catch(() => null) : null;
   const shimName = found?.info?.shim ?? appName;
   const versions = await installedVersions(appName);
   const current = await installedVersion(appName);
-  if (!opts.all && !parsed.version && versions.length > 1) {
-    throw new Error(
-      `There are multiple installed versions of '${appName}': ${versions.join(", ")}. Specify which one, or use --all.`,
-    );
+  if (parsed.version && parsed.version === current && !opts.all) {
+    throw new Error(`cannot remove current version '${appName}@${parsed.version}' alone. Use 'scoopix uninstall ${appName}' to remove the app, or switch to another version first.`);
   }
 
   const ownedShimCandidates = owner
@@ -2147,7 +2495,8 @@ async function uninstallApp(app: string, opts: { all?: boolean } = {}) {
   ];
   const removed: string[] = [];
 
-  const removeActiveLinks = opts.all || !parsed.version || parsed.version === current;
+  const removeWholeApp = opts.all || !parsed.version;
+  const removeActiveLinks = removeWholeApp || parsed.version === current;
   if (removeActiveLinks) {
     for (const candidate of candidates) {
       if (await removeOwnedShim(candidate, owner)) removed.push(candidate);
@@ -2155,20 +2504,12 @@ async function uninstallApp(app: string, opts: { all?: boolean } = {}) {
   }
 
   const appDir = join(APPS_DIR, appName);
-  const appState = await readAppState(appName);
-  const targetDir = parsed.version ? join(appDir, parsed.version) : appDir;
+  const targetDir = removeWholeApp ? appDir : join(appDir, parsed.version!);
   if (appState && owner && appState.owner !== owner) {
     warn(`Skipping '${appDir}'; owned by ${appState.owner}.`);
   } else if (await removeIfPresent(targetDir, { recursive: true })) {
     removed.push(targetDir);
-    if (removeActiveLinks) {
-      await removeIfPresent(join(appDir, "current"), { recursive: true });
-    }
-    const remainingVersions = await installedVersions(appName);
-    if (opts.all || remainingVersions.length === 0) {
-      await removeIfPresent(appDir, { recursive: true });
-      if (!appState || !owner || appState.owner === owner) await removeAppState(appName);
-    } else if (removeActiveLinks && (!appState || !owner || appState.owner === owner)) {
+    if (removeWholeApp && (!appState || !owner || appState.owner === owner)) {
       await removeAppState(appName);
     }
   }
@@ -2183,6 +2524,62 @@ async function uninstallApp(app: string, opts: { all?: boolean } = {}) {
   if (removed.some((path) => path.startsWith(BIN_DIR) || path.startsWith(DEFAULT_BIN_DIR))) {
     console.log("If Bash still tries a removed command path, clear its command cache with: hash -r");
   }
+}
+
+async function cleanupApp(app: string) {
+  const parsed = parseVersionedAppSpec(app);
+  const appSpec = parsed.app;
+  const appName = appSpec.includes("/") ? appSpec.split("/").pop()! : appSpec;
+  const requestedOwner = appSpec.includes("/") ? appSpec : null;
+  const state = await readAppState(appName);
+  if (!state) throw new Error(`'${app}' is not installed.`);
+  if (requestedOwner && state.owner !== requestedOwner) {
+    throw new Error(`'${appName}' is installed as ${state.owner}, not ${requestedOwner}. Use '${state.owner}' or '${appName}'.`);
+  }
+  const current = await installedVersion(appName);
+  if (!current) throw new Error(`'${app}' has no current installed version.`);
+  const removed: string[] = [];
+  for (const version of await installedVersions(appName)) {
+    if (version === current) continue;
+    const versionDir = join(APPS_DIR, appName, version);
+    if (await removeIfPresent(versionDir, { recursive: true })) removed.push(versionDir);
+  }
+  if (removed.length === 0) {
+    console.log(`${state.owner}:${current} has no old versions to clean up.`);
+    return;
+  }
+  console.log(`Cleaned up old versions for '${state.owner}'; current is ${current}:`);
+  for (const path of removed) console.log(`  removed ${path}`);
+}
+
+async function switchApp(app: string, version?: string) {
+  const parsed = parseVersionedAppSpec(app);
+  const appSpec = parsed.app;
+  const appName = appSpec.includes("/") ? appSpec.split("/").pop()! : appSpec;
+  const requestedOwner = appSpec.includes("/") ? appSpec : null;
+  const targetVersion = version ?? parsed.version;
+  if (!targetVersion) throw new Error("switch requires a version, for example: switch rtee@1.2.3");
+  const state = await readAppState(appName);
+  if (!state) throw new Error(`'${app}' is not installed.`);
+  if (requestedOwner && state.owner !== requestedOwner) {
+    throw new Error(`'${appName}' is installed as ${state.owner}, not ${requestedOwner}. Use '${state.owner}' or '${appName}'.`);
+  }
+  const versionDir = join(APPS_DIR, appName, targetVersion);
+  if (!(await pathExistsNoFollow(versionDir))) {
+    const versions = await installedVersions(appName);
+    throw new Error(`'${appName}@${targetVersion}' is not installed. Installed versions: ${versions.join(", ") || "<none>"}`);
+  }
+
+  const currentLink = join(APPS_DIR, appName, "current");
+  await removeIfPresent(currentLink, { recursive: true });
+  await Deno.symlink(versionDir, currentLink, { type: "dir" });
+
+  for (const shim of await ownedShimStates(state.owner)) {
+    const binName = basename(shim.target);
+    await writeShimState(shim.name, state.owner, targetVersion, join(currentLink, "bin", binName));
+  }
+  await writeAppState(appName, state.owner, targetVersion, state.version === targetVersion ? state.provenance : undefined);
+  console.log(`Switched '${state.owner}' to ${targetVersion}.`);
 }
 async function buildFromSource(
   app: string,
@@ -3505,6 +3902,8 @@ const AUTOTESTS = [
   "install-force",
   "install-alias",
   "install-version",
+  "list-semantics",
+  "app-lifecycle",
   "version-sources",
 ];
 
@@ -3716,6 +4115,69 @@ async function runAutotest(test = "all") {
       }
     };
 
+    const testListSemantics = async () => {
+      status("autotest: list defaults to installed apps and --all/search use bucket catalog");
+      await installApp("alpha/same", { ignoreDownloadCache: true });
+      const installed = (await installedAppLines(false)).join("\n");
+      assertIncludes(installed, "alpha/same - alpha source [installed: 1.0]", "installed listing should include installed app");
+      assertNotIncludes(installed, "alpha/multi", "installed listing should not include uninstalled catalog apps");
+
+      const catalog = (await catalogAppLines(false)).join("\n");
+      assertIncludes(catalog, "alpha/multi - alpha duplicate-name candidate", "catalog listing should include available app");
+      assertIncludes(catalog, "duplicate/multi - duplicate duplicate-name candidate", "catalog listing should include duplicate bucket app");
+
+      const filtered = (await catalogAppLines(false, "spaced")).join("\n");
+      assertIncludes(filtered, "alpha/spaced - multi-space version source candidate", "search should match app names");
+      assertNotIncludes(filtered, "alpha/multi", "search should filter non-matching apps");
+    };
+
+    const testAppLifecycle = async () => {
+      status("autotest: switch cleanup pin unpin reinstall and owner-scoped uninstall");
+      await installApp("alpha/same@1.0", { ignoreDownloadCache: true });
+      await installApp("alpha/same@2.0", { ignoreDownloadCache: true });
+      await switchApp("same@1.0");
+      if (await installedVersion("same") !== "1.0") {
+        throw new Error("switch should select installed version 1.0");
+      }
+
+      let ownerMismatch = "";
+      try {
+        await uninstallApp("beta/same");
+      } catch (err) {
+        ownerMismatch = err instanceof Error ? err.message : String(err);
+      }
+      assertIncludes(ownerMismatch, "installed as alpha/same, not beta/same", "qualified uninstall should enforce owner");
+
+      await cleanupApp("same");
+      const afterCleanup = await installedVersions("same");
+      if (afterCleanup.join(", ") !== "1.0") {
+        throw new Error(`cleanup should keep only current 1.0, got ${afterCleanup.join(", ")}`);
+      }
+
+      await installApp("alpha/same@2.0", { ignoreDownloadCache: true });
+      await switchApp("same@1.0");
+      await uninstallApp("same@2.0");
+      const afterOldUninstall = await installedVersions("same");
+      if (afterOldUninstall.join(", ") !== "1.0") {
+        throw new Error(`uninstall old app@version should keep current 1.0, got ${afterOldUninstall.join(", ")}`);
+      }
+
+      await pinVersion("same");
+      await upgradeApps();
+      if (await installedVersion("same") !== "1.0") {
+        throw new Error("bulk upgrade should skip pinned current version");
+      }
+      await unpinVersion("same");
+      await reinstallApp("same");
+      if (await Deno.readTextFile(join(APPS_DIR, "same", "1.0", "bin", "same")) !== "alpha-1.0") {
+        throw new Error("reinstall should preserve current selected version content");
+      }
+      await uninstallApp("same");
+      if ((await installedVersions("same")).length !== 0) {
+        throw new Error("unqualified uninstall should remove all versions");
+      }
+    };
+
     if (test === "locks") {
       await testLocks();
       console.log("autotest passed: locks");
@@ -3736,6 +4198,16 @@ async function runAutotest(test = "all") {
       console.log("autotest passed: install-version");
       return;
     }
+    if (test === "list-semantics") {
+      await testListSemantics();
+      console.log("autotest passed: list-semantics");
+      return;
+    }
+    if (test === "app-lifecycle") {
+      await testAppLifecycle();
+      console.log("autotest passed: app-lifecycle");
+      return;
+    }
     if (test === "version-sources") {
       await testVersionSources();
       console.log("autotest passed: version-sources");
@@ -3746,6 +4218,7 @@ async function runAutotest(test = "all") {
     await testInstallForce();
     await testInstallAlias();
     await testInstallVersion();
+    await testListSemantics();
     await testVersionSources();
 
     status("autotest: installed listing is deduped and source-qualified");
@@ -3866,28 +4339,31 @@ async function runAutotest(test = "all") {
       throw new Error(`upgrade --version should downgrade to 1.0, got ${downgradedVersion}`);
     }
 
-    status("autotest: uninstall requires a version when multiple versions are installed");
+    status("autotest: uninstall removes all installed app versions by default");
     let uninstallMessage = "";
     try {
-      await uninstallApp("same");
+      await uninstallApp("same@1.0");
     } catch (err) {
       uninstallMessage = err instanceof Error ? err.message : String(err);
     }
     assertIncludes(
       uninstallMessage,
-      "There are multiple installed versions of 'same': 2.0, 1.0. Specify which one, or use --all.",
-      "uninstall should require a version when multiple versions exist",
+      "cannot remove current version 'same@1.0' alone",
+      "uninstall current app@version should require switching or whole-app uninstall",
     );
     await uninstallApp("same@2.0");
     const afterSpecificUninstall = await installedVersions("same");
     if (afterSpecificUninstall.join(", ") !== "1.0") {
       throw new Error(`uninstall app@version should leave only 1.0, got ${afterSpecificUninstall.join(", ")}`);
     }
-    await uninstallApp("same", { all: true });
+    await installApp("alpha/same@2.0", { ignoreDownloadCache: true });
+    await uninstallApp("same");
     const afterUninstallAll = await installedVersions("same");
     if (afterUninstallAll.length !== 0) {
-      throw new Error(`uninstall --all should remove every version, got ${afterUninstallAll.join(", ")}`);
+      throw new Error(`uninstall without version should remove every version, got ${afterUninstallAll.join(", ")}`);
     }
+
+    await testAppLifecycle();
 
     console.log("autotest passed");
   } finally {
@@ -3939,6 +4415,7 @@ await new Command()
   .option("--ignore-download-cache", "Force re-download even if cached")
   .option("--force-artifact-build", "Force rebuilding artifact outputs even if cached")
   .option("--approve-rustc-build", "Allow compiling downloaded Rust source with local rustc")
+  .option("--live", "Record a direct local source as live-followed for upgrade refreshes")
   .option("--as <name:string>", "Install the primary command shim under this name")
   .option("--name <name:string>", "Set the app identity for direct local source installs")
   .option("--shim-prefix <prefix:string>", "Prefix all installed command shim names")
@@ -3964,6 +4441,7 @@ await new Command()
           ignoreDownloadCache: opts.force || opts.ignoreDownloadCache,
           forceArtifactBuild: opts.force || opts.forceArtifactBuild,
           approveRustcBuild: opts.approveRustcBuild,
+          live: opts.live,
           as: opts.as,
           name: opts.name,
           shimPrefix: opts.shimPrefix,
@@ -4037,15 +4515,116 @@ await new Command()
       Deno.exit(1);
     }
   })
-  .command(
-    "update <app:string> <version:string>",
-    "Update a local bucket manifest entry to a specific discovered version",
-  )
-  .action(async (_opts, app, version) => {
+  .command("reinstall <app:string>", "Reinstall the current app version or source identity")
+  .option("--ignore-build-cache", "Force rebuild from source, ignoring cached Docker image")
+  .option("--ignore-download-cache", "Force re-download even if cached")
+  .option("--force-artifact-build", "Force rebuilding artifact outputs even if cached")
+  .option("--approve-rustc-build", "Allow compiling downloaded Rust source with local rustc")
+  .option("--keep-temp", "Keep extracted files in ~/.scoopix/temp/<app>")
+  .option("--system", "Run system install commands after building, requires root")
+  .action(async (opts, app) => {
     try {
-      await updateManifestAppVersion(app, version);
+      if (opts.system && !(await isRootUser())) {
+        error(`reinstall: --system requires root`);
+        console.error("To reinstall system-wide, start the command with sudo:");
+        console.error(`  ${SCOOPIX_SYSTEM_COMMAND} reinstall ${app} --system`);
+        Deno.exit(1);
+      }
+      await reinstallApp(app, {
+        ignoreBuildCache: opts.ignoreBuildCache,
+        ignoreDownloadCache: opts.ignoreDownloadCache,
+        forceArtifactBuild: opts.forceArtifactBuild,
+        approveRustcBuild: opts.approveRustcBuild,
+        keepTemp: opts.keepTemp,
+        system: opts.system,
+      });
     } catch (err) {
-      error(`Update failed: ${app}`);
+      error(`Reinstall failed: ${app}`);
+      console.error(`Reason: ${err instanceof Error ? err.message : String(err)}`);
+      Deno.exit(1);
+    }
+  })
+  .command("downgrade <app:string>", "Install an explicit older app version")
+  .option("--version <version:string>", "Version to install, alternative to app@version")
+  .option("--approve-rustc-build", "Allow compiling downloaded Rust source with local rustc")
+  .option("--keep-temp", "Keep extracted files in ~/.scoopix/temp/<app>")
+  .action(async (opts, app) => {
+    try {
+      await downgradeApp(app, {
+        version: opts.version,
+        approveRustcBuild: opts.approveRustcBuild,
+        keepTemp: opts.keepTemp,
+      });
+    } catch (err) {
+      error(`Downgrade failed: ${app}`);
+      console.error(`Reason: ${err instanceof Error ? err.message : String(err)}`);
+      Deno.exit(1);
+    }
+  })
+  .command("switch <app:string>", "Switch current symlink to an already installed app version")
+  .option("--version <version:string>", "Version to switch to, alternative to app@version")
+  .action(async (opts, app) => {
+    try {
+      await switchApp(app, opts.version);
+    } catch (err) {
+      error(`Switch failed: ${app}`);
+      console.error(`Reason: ${err instanceof Error ? err.message : String(err)}`);
+      Deno.exit(1);
+    }
+  })
+  .command("cleanup <app:string>", "Remove old installed versions while keeping current")
+  .action(async (_opts, app) => {
+    try {
+      await cleanupApp(app);
+    } catch (err) {
+      error(`Cleanup failed: ${app}`);
+      console.error(`Reason: ${err instanceof Error ? err.message : String(err)}`);
+      Deno.exit(1);
+    }
+  })
+  .command("pin <app:string>", "Pin current or explicit app version and hold it from bulk upgrades")
+  .option("--version <version:string>", "Version to pin, alternative to app@version")
+  .option("--reason <reason:string>", "Why this version is pinned")
+  .action(async (opts, app) => {
+    try {
+      await pinVersion(app, opts.version, opts.reason);
+    } catch (err) {
+      error(`Pin failed: ${app}`);
+      console.error(`Reason: ${err instanceof Error ? err.message : String(err)}`);
+      Deno.exit(1);
+    }
+  })
+  .command("unpin <app:string>", "Remove app pin")
+  .option("--version <version:string>", "Version to unpin, alternative to app@version")
+  .action(async (opts, app) => {
+    try {
+      await unpinVersion(app, opts.version);
+    } catch (err) {
+      error(`Unpin failed: ${app}`);
+      console.error(`Reason: ${err instanceof Error ? err.message : String(err)}`);
+      Deno.exit(1);
+    }
+  })
+  .command("fetch [target:string]", "Fetch configured bucket metadata without changing installed apps")
+  .action(async (_opts, target) => {
+    try {
+      await forceBucketUpdate(target);
+    } catch (err) {
+      error(`Fetch failed${target ? `: ${target}` : ""}`);
+      console.error(`Reason: ${err instanceof Error ? err.message : String(err)}`);
+      Deno.exit(1);
+    }
+  })
+  .command(
+    "update [target:string]",
+    "Compatibility alias for fetch",
+  )
+  .action(async (_opts, target) => {
+    try {
+      warn("'update' is kept for compatibility. Prefer: scoopix fetch");
+      await forceBucketUpdate(target);
+    } catch (err) {
+      error(`Update failed${target ? `: ${target}` : ""}`);
       console.error(`Reason: ${err instanceof Error ? err.message : String(err)}`);
       if (VERBOSITY - QUIET >= 2 && err instanceof Error && err.stack) {
         console.error(err.stack);
@@ -4110,6 +4689,101 @@ await new Command()
       .action(async (_opts, name) => {
         await removeBucket(name);
       })
+      .command("remove <name:string>", "Remove a configured bucket")
+      .action(async (_opts, name) => {
+        await removeBucket(name);
+      })
+      .command("fetch [name:string]", "Fetch one configured bucket, or all git-backed local buckets")
+      .action(async (_opts, name) => {
+        await forceBucketUpdate(name);
+      })
+      .command("apply <app:string> <version:string>", "Apply a discovered version to a local bucket manifest")
+      .action(async (_opts, app, version) => {
+        try {
+          await updateManifestAppVersion(app, version);
+        } catch (err) {
+          error(`Bucket apply failed: ${app}`);
+          console.error(`Reason: ${err instanceof Error ? err.message : String(err)}`);
+          Deno.exit(1);
+        }
+      })
+      .command("discover <app:string>", "Discover available versions for a bucket app without mutating manifests")
+      .action(async (_opts, app) => {
+        await bucketDiscover(app);
+      })
+      .command("import <app:string> [version:string]", "Import discovered version records into local saved metadata")
+      .action(async (_opts, app, version) => {
+        try {
+          await bucketImport(app, version);
+        } catch (err) {
+          error(`Bucket import failed: ${app}`);
+          console.error(`Reason: ${err instanceof Error ? err.message : String(err)}`);
+          Deno.exit(1);
+        }
+      })
+      .command("ignore <app:string> <version:string>", "Record an intentionally ignored discovered version")
+      .option("--reason <reason:string>", "Why this version is ignored")
+      .action(async (opts, app, version) => {
+        try {
+          await bucketIgnore(app, version, opts.reason);
+        } catch (err) {
+          error(`Bucket ignore failed: ${app}`);
+          console.error(`Reason: ${err instanceof Error ? err.message : String(err)}`);
+          Deno.exit(1);
+        }
+      })
+      .command("test <app:string>", "Build/install-test a bucket app")
+      .option("--approve-rustc-build", "Allow compiling downloaded Rust source with local rustc")
+      .action(async (opts, app) => {
+        try {
+          await bucketTest(app, { approveRustcBuild: opts.approveRustcBuild, suppressOutput: false });
+        } catch (err) {
+          error(`Bucket test failed: ${app}`);
+          console.error(`Reason: ${err instanceof Error ? err.message : String(err)}`);
+          Deno.exit(1);
+        }
+      })
+      .command("commit [target:string]", "Commit local bucket metadata changes")
+      .option("-m, --message <message:string>", "Commit message")
+      .action(async (opts, target) => {
+        try {
+          await bucketCommit(target, opts.message);
+        } catch (err) {
+          error(`Bucket commit failed${target ? `: ${target}` : ""}`);
+          console.error(`Reason: ${err instanceof Error ? err.message : String(err)}`);
+          Deno.exit(1);
+        }
+      })
+      .command("push [name:string]", "Push a local git-backed bucket")
+      .action(async (_opts, name) => {
+        try {
+          await bucketPush(name ?? "main");
+        } catch (err) {
+          error(`Bucket push failed${name ? `: ${name}` : ""}`);
+          console.error(`Reason: ${err instanceof Error ? err.message : String(err)}`);
+          Deno.exit(1);
+        }
+      })
+      .command("reset <target:string>", "Reset local bucket manifest changes from git")
+      .action(async (_opts, target) => {
+        try {
+          await bucketReset(target);
+        } catch (err) {
+          error(`Bucket reset failed: ${target}`);
+          console.error(`Reason: ${err instanceof Error ? err.message : String(err)}`);
+          Deno.exit(1);
+        }
+      })
+      .command("lint [target:string]", "Validate bucket manifests")
+      .action(async (_opts, target) => {
+        try {
+          await bucketLint(target);
+        } catch (err) {
+          error(`Bucket lint failed${target ? `: ${target}` : ""}`);
+          console.error(`Reason: ${err instanceof Error ? err.message : String(err)}`);
+          Deno.exit(1);
+        }
+      })
       .command("list", "List available buckets")
       .action(async () => {
         await ensureDefaultMainBucket();
@@ -4117,17 +4791,37 @@ await new Command()
         for (const b of buckets) console.log(b);
       }),
   )
-  .command("list", "List all apps in all buckets")
+  .command("list", "List installed apps; use --all to list bucket catalog apps")
   .option("--full", "Show full bucket path")
-  .option("--installed", "Show only installed apps")
+  .option("--installed", "Show only installed apps; kept for compatibility")
+  .option("--all", "Show all available apps from configured buckets")
   .action(async (cliOpts) => {
-    await listApps(cliOpts.full ?? false, cliOpts.installed ?? false);
+    if (cliOpts.all && cliOpts.installed) {
+      error("list: --all and --installed cannot be combined");
+      Deno.exit(1);
+    }
+    await listApps(cliOpts.full ?? false, !cliOpts.all);
   })
   .command("ls", "Alias for list")
   .option("--full", "Show full bucket path")
-  .option("--installed", "Show only installed apps")
+  .option("--installed", "Show only installed apps; kept for compatibility")
+  .option("--all", "Show all available apps from configured buckets")
   .action(async (cliOpts) => {
-    await listApps(cliOpts.full ?? false, cliOpts.installed ?? false);
+    if (cliOpts.all && cliOpts.installed) {
+      error("ls: --all and --installed cannot be combined");
+      Deno.exit(1);
+    }
+    await listApps(cliOpts.full ?? false, !cliOpts.all);
+  })
+  .command("search [query:string]", "Search configured bucket catalog apps")
+  .option("--full", "Show full bucket path")
+  .action(async (cliOpts, query) => {
+    await listApps(cliOpts.full ?? false, false, query);
+  })
+  .command("available [query:string]", "List available bucket catalog apps, optionally filtered by query")
+  .option("--full", "Show full bucket path")
+  .action(async (cliOpts, query) => {
+    await listApps(cliOpts.full ?? false, false, query);
   })
   .command("installed", "List installed apps")
   .option("--full", "Show full bucket path")
